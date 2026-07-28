@@ -191,6 +191,11 @@ def _draft_review(draft: Draft) -> str:
         for item in draft.inputs
     ]
     model_lines = [f"  - {model}" for model in draft.models]
+    web_search_line = (
+        "Web search: on — research models read live sources, so this run is not reproducible."
+        if draft.web_search
+        else "Web search: off — research models answer from training data only."
+    )
     return "\n".join(
         [
             "Research draft ready — no provider model calls have been dispatched.",
@@ -205,6 +210,7 @@ def _draft_review(draft: Draft) -> str:
             "Research models:",
             *model_lines,
             f"Grading model: {draft.grading_model}",
+            web_search_line,
             "",
             "Brief sent verbatim:",
             draft.brief.verbatim(),
@@ -229,6 +235,7 @@ async def begin_research(
     models: list[str] | None = None,
     grading_model: str = DEFAULT_GRADING_MODEL,
     ceiling_usd: float = 1.0,
+    web_search: bool = True,
 ) -> str:
     """Begin a research commission from pasted text and/or a supported GitHub URL.
 
@@ -237,6 +244,11 @@ async def begin_research(
     lookup, and saves a local review draft. It does NOT call research or grading
     models. Show the returned review to the operator; do not call ``run_research``
     unless the operator explicitly approves it.
+
+    ``web_search`` gives the research models live web access through OpenRouter's
+    web plugin, so claims can rest on fetched sources rather than recalled ones.
+    It is on by default. Turning it off makes a run reproducible from its inputs
+    alone, at the cost of everything the models cannot already recall.
     """
     config = _config_or_message()
     if isinstance(config, str):
@@ -268,6 +280,7 @@ async def begin_research(
                 selected_models,
                 grading_model.strip(),
                 ceiling_usd,
+                web_search,
             )
         return _draft_review(draft)
     except (

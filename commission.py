@@ -37,15 +37,26 @@ DEFAULT_MODELS = [
 ]
 DEFAULT_GRADING_MODEL = "anthropic/claude-sonnet-4.6"
 
+# OpenRouter's web plugin, documented as exactly equivalent to the ``:online``
+# model suffix. The suffix is not a catalogue entry, so it would break the
+# ``/models`` pricing lookup; the plugin keeps model ids canonical.
+WEB_PLUGIN_MAX_RESULTS = 5
+# Exa (the default engine) bills $0.005 per request for up to 10 results.
+WEB_SEARCH_COST_USD = 0.005
+
 
 class CommissionError(RuntimeError):
     """A commission cannot safely advance to its next lifecycle state."""
 
 
 class Gateway(Protocol):
-    async def estimate(self, models: list[str], input_tokens: int) -> float: ...
+    async def estimate(
+        self, models: list[str], input_tokens: int, *, web_search: bool = False
+    ) -> float: ...
 
-    async def complete(self, model: str, prompt: str) -> CallRecord: ...
+    async def complete(
+        self, model: str, prompt: str, *, web_search: bool = False
+    ) -> CallRecord: ...
 
 
 def _safe_model_name(model_id: str) -> str:
@@ -154,7 +165,9 @@ class OpenRouterGateway:
         if self._owns_client:
             await self.client.aclose()
 
-    async def estimate(self, models: list[str], input_tokens: int) -> float:
+    async def estimate(
+        self, models: list[str], input_tokens: int, *, web_search: bool = False
+    ) -> float:
         response = await self.client.get("/models")
         response.raise_for_status()
         payload = response.json()
@@ -172,19 +185,24 @@ class OpenRouterGateway:
             completion = float(pricing.get("completion") or 0)
             request = float(pricing.get("request") or 0)
             total += input_tokens * prompt + 2_000 * completion + request
+            if web_search:
+                total += WEB_SEARCH_COST_USD
         return round(total, 6)
 
-    async def complete(self, model: str, prompt: str) -> CallRecord:
+    async def complete(self, model: str, prompt: str, *, web_search: bool = False) -> CallRecord:
         started = time.monotonic()
+        request_body: dict[str, Any] = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.1,
+        }
+        if web_search:
+            request_body["plugins"] = [{"id": "web", "max_results": WEB_PLUGIN_MAX_RESULTS}]
         try:
             response = await self.client.post(
                 "/chat/completions",
                 headers={"X-OpenRouter-Metadata": "enabled"},
-                json={
-                    "model": model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.1,
-                },
+                json=request_body,
             )
         except httpx.HTTPError as exc:
             return CallRecord(
@@ -388,6 +406,7 @@ class CommissionService:
         models: list[str],
         grading_model: str,
         ceiling_usd: float,
+        web_search: bool = True,
     ) -> Draft:
         if not brief.task.strip():
             raise CommissionError("The Task field is required.")
@@ -400,7 +419,10 @@ class CommissionService:
         estimate: float | None = None
         pricing_error: str | None = None
         try:
-            research_estimate = await self.gateway.estimate(models, input_tokens)
+            research_estimate = await self.gateway.estimate(
+                models, input_tokens, web_search=web_search
+            )
+            # Grading reads the research bodies; it never searches.
             grading_input_tokens = input_tokens + 2_000 * len(models)
             grading_estimate = await self.gateway.estimate([grading_model], grading_input_tokens)
             estimate = round(research_estimate + grading_estimate, 6)
@@ -416,6 +438,7 @@ class CommissionService:
             ceiling_usd=ceiling_usd,
             estimate_usd=estimate,
             pricing_error=pricing_error,
+            web_search=web_search,
         )
         self.store.save_draft(draft)
         return draft
@@ -439,6 +462,7 @@ class CommissionService:
             inputs=draft.inputs,
             dispatched_models=draft.models,
             grading_model=draft.grading_model,
+            web_search=draft.web_search,
         )
         run_dir = self.store.run_dir(run_id)
         self.store.write_run(run)
@@ -457,7 +481,10 @@ class CommissionService:
 
         prompt = _research_prompt(draft.brief, draft.inputs)
         calls = await asyncio.gather(
-            *(self.gateway.complete(model, prompt) for model in draft.models)
+            *(
+                self.gateway.complete(model, prompt, web_search=draft.web_search)
+                for model in draft.models
+            )
         )
         for call in calls:
             _write_atomic(
@@ -471,6 +498,12 @@ class CommissionService:
             for call in calls
             if call.status == "failed"
         ]
+        if draft.web_search:
+            # brief_sha256 pins the question, not the answer: live sources move.
+            limitations.append(
+                f"Research calls searched the live web on {started.date().isoformat()}; "
+                "re-running this brief will read whatever the sources say then, not now."
+            )
         claims: list[ClaimRecord] = []
         scores: list[ScoreRecord] = []
         grading_call: CallRecord | None = None

@@ -50,6 +50,7 @@ class Draft(BaseModel):
     ceiling_usd: float
     estimate_usd: float | None
     pricing_error: str | None = None
+    web_search: bool = True
 
 
 class CallRecord(BaseModel):
@@ -95,4 +96,5 @@ class RunRecord(BaseModel):
     inputs: list[InputArtifact]
     dispatched_models: list[str]
     grading_model: str
+    web_search: bool = False
     limitations: list[str] = Field(default_factory=list)
