@@ -1,14 +1,8 @@
-"""Alexandria MCP server: read/status tools over the research/ tree, so a
-connected model can see what the repository already knows before proposing
-new work — the same stdio/--http shape wingman's mcp_server.py proved out,
-forked via templates/mcp-server/.
+"""Alexandria MCP server: repository recall plus guarded research commissions.
 
-Every tool here is read-only and deterministic: no model call, no network,
-no write. That matches the repository's early stage (docs/DESIGN.md: "the
-repository is the durable system of record") — there is no orchestration
-harness to dispatch here yet (see docs/orchestration-harness.md for that
-separate, not-yet-built concern), so this server has nothing to gate
-behind a confirmation step.
+The recall tools are read-only and deterministic. ``begin_research`` resolves
+operator-supplied inputs and creates a local review draft; ``run_research`` is
+the separate, explicitly confirmed OpenRouter spend boundary.
 """
 
 from __future__ import annotations
@@ -16,6 +10,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import logging
+import math
 import os
 import secrets
 import socket
@@ -24,11 +19,21 @@ from collections import Counter
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 
+import httpx
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from alexandria.commission import (
+    DEFAULT_GRADING_MODEL,
+    DEFAULT_MODELS,
+    CommissionError,
+    CommissionService,
+    OpenRouterGateway,
+    RunStore,
+)
+from alexandria.commission_models import Brief, Draft
 from alexandria.infrastructure.config import Config, RepoNotFoundError, load_config
 from alexandria.infrastructure.mcp_process import clear_pidfile, read_server_pid, write_pidfile
 from alexandria.infrastructure.research_repo import (
@@ -36,6 +41,13 @@ from alexandria.infrastructure.research_repo import (
     find_investigation,
     list_investigations,
     search_investigations,
+)
+from alexandria.infrastructure.secrets import SecretNotFoundError, openrouter_api_key
+from alexandria.input_resolution import (
+    GitHubResolver,
+    InputResolutionError,
+    pasted_input,
+    validate_input_set,
 )
 from alexandria.version import service_version
 
@@ -155,6 +167,161 @@ def search_research(query: str, limit: int = 10) -> str:
         return f"No matches for {query!r} under research/."
     lines = [f"{hit.slug}/{hit.relative_path}:{hit.line_number}: {hit.snippet}" for hit in hits]
     return "\n".join(lines)
+
+
+def _draft_review(draft: Draft) -> str:
+    confirmation = f"RUN {draft.draft_id}"
+    if draft.estimate_usd is None:
+        estimate = "unavailable"
+        pricing_note = (
+            "The run may still be dispatched; the OpenRouter key limit is the active ceiling."
+        )
+    else:
+        estimate = f"${draft.estimate_usd:.4f} maximum"
+        pricing_note = (
+            "Dispatch is blocked because the estimate exceeds the hard ceiling."
+            if draft.estimate_usd > draft.ceiling_usd
+            else "The estimate is within the hard ceiling."
+        )
+    input_lines = [
+        (
+            f"  - {item.name}: {item.state}, {item.bytes} bytes, "
+            f"{item.extracted_chars} chars, sha256={item.sha256[:12]}"
+        )
+        for item in draft.inputs
+    ]
+    model_lines = [f"  - {model}" for model in draft.models]
+    return "\n".join(
+        [
+            "Research draft ready — no provider model calls have been dispatched.",
+            f"Draft: {draft.draft_id}",
+            f"Estimate: {estimate}",
+            f"Hard ceiling: ${draft.ceiling_usd:.2f}",
+            pricing_note,
+            "",
+            "Inputs:",
+            *input_lines,
+            "",
+            "Research models:",
+            *model_lines,
+            f"Grading model: {draft.grading_model}",
+            "",
+            "Brief sent verbatim:",
+            draft.brief.verbatim(),
+            "",
+            "Dispatch requires the operator to explicitly approve this review.",
+            (
+                f'After approval, call run_research(draft_id="{draft.draft_id}", '
+                f'confirmation="{confirmation}").'
+            ),
+        ]
+    )
+
+
+@server.tool()
+async def begin_research(
+    task: str,
+    pasted_content: str = "",
+    url: str = "",
+    context: str = "",
+    constraints: str = "",
+    output_needs: str = "",
+    models: list[str] | None = None,
+    grading_model: str = DEFAULT_GRADING_MODEL,
+    ceiling_usd: float = 1.0,
+) -> str:
+    """Begin a research commission from pasted text and/or a supported GitHub URL.
+
+    The URL may identify a GitHub repository, issue, pull request, or supported
+    text/PDF/HTML/Markdown blob. This tool resolves inputs, performs a live pricing
+    lookup, and saves a local review draft. It does NOT call research or grading
+    models. Show the returned review to the operator; do not call ``run_research``
+    unless the operator explicitly approves it.
+    """
+    config = _config_or_message()
+    if isinstance(config, str):
+        return config
+    if not math.isfinite(ceiling_usd) or ceiling_usd <= 0:
+        return "Commission not ready: ceiling_usd must be a positive finite amount."
+    if not grading_model.strip():
+        return "Commission not ready: grading_model is required."
+    try:
+        inputs = []
+        pasted = pasted_input(pasted_content)
+        if pasted is not None:
+            inputs.append(pasted)
+        resolved_url = url.strip()
+        if resolved_url:
+            async with GitHubResolver() as resolver:
+                inputs.extend(await resolver.resolve(resolved_url))
+        validate_input_set(inputs)
+        selected_models = list(DEFAULT_MODELS if models is None else models)
+        async with OpenRouterGateway(openrouter_api_key()) as gateway:
+            draft = await CommissionService(config, gateway).create_draft(
+                Brief(
+                    task=task,
+                    context=context,
+                    constraints=constraints,
+                    output_needs=output_needs,
+                ),
+                inputs,
+                selected_models,
+                grading_model.strip(),
+                ceiling_usd,
+            )
+        return _draft_review(draft)
+    except (
+        CommissionError,
+        httpx.HTTPError,
+        InputResolutionError,
+        OSError,
+        SecretNotFoundError,
+        ValueError,
+    ) as exc:
+        return f"Commission not ready: {exc}"
+
+
+@server.tool()
+async def run_research(draft_id: str, confirmation: str = "") -> str:
+    """Dispatch a reviewed research draft, incurring OpenRouter spend.
+
+    First call ``begin_research`` and show its complete review to the operator.
+    Call this tool only after the operator explicitly approves that review and
+    supplies the exact confirmation phrase returned with it. A missing or stale
+    phrase leaves the draft untouched and dispatches nothing.
+    """
+    config = _config_or_message()
+    if isinstance(config, str):
+        return config
+    try:
+        draft = RunStore(config.data_dir).load_draft(draft_id.strip())
+    except (CommissionError, OSError, ValueError) as exc:
+        return f"Run did not start: {exc}"
+    expected = f"RUN {draft.draft_id}"
+    if confirmation != expected:
+        return "\n".join(
+            [
+                _draft_review(draft),
+                "",
+                "Dispatch blocked: explicit operator approval is required.",
+                f'Use the exact confirmation phrase: "{expected}"',
+            ]
+        )
+    try:
+        async with OpenRouterGateway(openrouter_api_key()) as gateway:
+            run = await CommissionService(config, gateway).dispatch(draft.draft_id)
+    except (CommissionError, OSError, SecretNotFoundError, ValueError) as exc:
+        return f"Run did not start: {exc}"
+    actual_cost = f"${run.cost_actual:.4f}" if run.cost_actual is not None else "unavailable"
+    return "\n".join(
+        [
+            "Research run finished.",
+            f"Run: {run.run_id}",
+            f"Status: {run.status}",
+            f"Actual cost: {actual_cost}",
+            f"Artifacts: {RunStore(config.data_dir).run_dir(run.run_id)}",
+        ]
+    )
 
 
 async def _health(request: Request) -> JSONResponse:
@@ -327,7 +494,10 @@ def main(argv: list[str] | None = None) -> None:
     register_admin(server)
     for line in render_urls(token, extra_hosts, host=args.host, port=args.port):
         print(line)
-    print("The URL is a capability — anyone holding it can read this repository's research/.")
+    print(
+        "The URL is a capability — anyone holding it can read research/ and, after "
+        "draft confirmation, spend through the configured OpenRouter key."
+    )
     print("Revoke it any time: alexandria-mcp --http --rotate-token")
     sys.stdout.flush()
     logging.getLogger("uvicorn.access").disabled = True
