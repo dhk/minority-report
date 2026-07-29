@@ -462,6 +462,12 @@ def _manifest(root: Path, spec: PackSpec, bundle_id: str) -> dict[str, Any]:
         "capability": asdict(spec.capability) if spec.capability else None,
         "tailscale": asdict(spec.tailscale) if spec.tailscale else None,
         "registry": asdict(spec.registry) if spec.registry else None,
+        "pack_manager": {
+            "format_version": 1,
+            "command": "tool-pack-manager",
+            "install_path": "/usr/local/bin/tool-pack-manager",
+            "privileged": True,
+        },
     }
 
 
@@ -575,12 +581,15 @@ def build_bundle(
     docs_launcher = root / "deploy" / "docs.py"
     component_checks = root / "deploy" / "checks.py"
     service_registry = root / "deploy" / "service_registry.py"
+    pack_manager = root / "deploy" / "pack_manager.py"
     if Path("deploy/install.py") not in files or not installer.is_file():
         raise PackError("deploy/install.py must be present and included in the source set")
     if Path("deploy/docs.py") not in files or not docs_launcher.is_file():
         raise PackError("deploy/docs.py must be present and included in the source set")
     if Path("deploy/checks.py") not in files or not component_checks.is_file():
         raise PackError("deploy/checks.py must be present and included in the source set")
+    if Path("deploy/pack_manager.py") not in files or not pack_manager.is_file():
+        raise PackError("deploy/pack_manager.py must be present and included in the source set")
     if spec.registry is not None and (
         Path("deploy/service_registry.py") not in files or not service_registry.is_file()
     ):
@@ -609,6 +618,8 @@ def build_bundle(
         (staging / "install.py").chmod(0o755)
         shutil.copy2(docs_launcher, staging / "launch-docs.py")
         (staging / "launch-docs.py").chmod(0o755)
+        shutil.copy2(pack_manager, staging / "manage-packs.py")
+        (staging / "manage-packs.py").chmod(0o755)
         bundled_deploy = staging / "deploy"
         bundled_deploy.mkdir()
         (bundled_deploy / "__init__.py").write_text("", encoding="utf-8")
@@ -669,6 +680,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  ssh lobster 'sha256sum -c {result.checksum.name}'")
     print(f"  ssh lobster 'tar -xzf {result.archive.name} && ./{result.bundle_root}/install.py'")
     print(f"  # Human docs after unpacking: ./{result.bundle_root}/launch-docs.py")
+    print("  # After bootstrap, inspect future uploads with: ssh -t lobster tool-pack-manager")
     return 0
 
 

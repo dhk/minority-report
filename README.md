@@ -59,7 +59,7 @@ Corpus design and normative artifact contracts remain authoritative in
 
 ```text
 src/alexandria/       orchestration, MCP/web surfaces, control CLI, adapters
-deploy/               pack installer, documentation launcher, host registry
+deploy/               pack installer, pack manager, documentation launcher, host registry
 templates/mcp-server/ reusable MCP service scaffold
 scripts/              validation, packaging, and corpus-derived exports
 tests/                executable behavior and corpus compatibility tests

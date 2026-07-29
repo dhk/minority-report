@@ -308,6 +308,24 @@ def run_component_checks(
             ),
         )
     )
+    pack_manager = manifest.get("pack_manager")
+    if isinstance(pack_manager, dict):
+        manager_path = _expanded(str(pack_manager.get("install_path", "")))
+        manager_ready = (
+            manager_path.is_file()
+            and "tool-pack-manager-format: 1"
+            in manager_path.read_text(encoding="utf-8", errors="replace")[:512]
+        )
+        checks.append(
+            CheckResult(
+                "pack_manager",
+                "Pack manager",
+                "pass" if manager_ready else "fail",
+                str(manager_path)
+                if manager_ready
+                else f"missing managed command at {manager_path}",
+            )
+        )
 
     secrets_file = _expanded(str(install.get("secrets_file", "")))
     required = install.get("required_secrets", [])

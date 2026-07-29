@@ -44,6 +44,7 @@ _PACK_ROOT_MARKER = ".tool-pack-root.json"
 _INSTALL_ROOT_ATTEMPTS = 3
 _SUPPORT_MARKER = ".tool-pack-support.json"
 _REGISTRY_MARKER = "common-services-registry-format: 1"
+_PACK_MANAGER_MARKER = "tool-pack-manager-format: 1"
 
 
 def load_manifest(path: Path) -> dict[str, Any]:
@@ -438,7 +439,12 @@ def install_support(
     staging = support_root / f".{bundle_id}.staging-{uuid.uuid4().hex[:8]}"
     try:
         staging.mkdir()
-        for filename in ("launch-docs.py", "docs-index.html", "pack-manifest.json"):
+        for filename in (
+            "launch-docs.py",
+            "manage-packs.py",
+            "docs-index.html",
+            "pack-manifest.json",
+        ):
             source = bundle_root / filename
             if not source.is_file():
                 raise InstallError(f"bundle support file is missing: {source}")
@@ -470,6 +476,100 @@ def bundle_cleanup_targets(bundle_root: Path, manifest: Mapping[str, Any]) -> li
         )
     archive = bundle_root.with_name(f"{bundle_root.name}.tar.gz")
     return [archive, archive.with_suffix(archive.suffix + ".sha256"), bundle_root]
+
+
+def install_pack_manager(
+    bundle_root: Path,
+    manifest: Mapping[str, Any],
+    *,
+    interactive: bool,
+    input_fn: Callable[[str], str],
+    runner: Runner = _default_runner,
+) -> Path:
+    config = manifest.get("pack_manager")
+    if not isinstance(config, dict):
+        raise InstallError("pack manifest is missing pack_manager configuration")
+    source = bundle_root / "manage-packs.py"
+    target = _expanded(str(config.get("install_path", "")))
+    if not source.is_file():
+        raise InstallError(f"pack manager payload is missing: {source}")
+    if not target.is_absolute():
+        raise InstallError(f"pack manager install path must be absolute: {target}")
+    if target.exists() and not target.is_file():
+        raise InstallError(f"refusing non-file pack manager target: {target}")
+    desired = source.read_bytes()
+    existing = target.read_bytes() if target.is_file() else None
+    if existing == desired:
+        return target
+    managed = existing is None or _PACK_MANAGER_MARKER.encode() in existing[:512]
+    privileged = config.get("privileged", False)
+    if not isinstance(privileged, bool):
+        raise InstallError("pack manager privileged setting must be a boolean")
+    if existing is not None:
+        if not interactive and not managed:
+            raise InstallError(
+                f"refusing to replace unknown pack manager non-interactively: {target}"
+            )
+        if interactive and not _confirm(
+            f"Back up and replace pack manager {target}?",
+            default=managed,
+            input_fn=input_fn,
+        ):
+            raise InstallError("required pack manager was not installed")
+    elif interactive and not _confirm(
+        f"Install the pack manager at {target}?",
+        default=True,
+        input_fn=input_fn,
+    ):
+        raise InstallError("required pack manager was not installed")
+
+    if privileged:
+        runner(["sudo", "install", "-d", "-m", "0755", str(target.parent)])
+        if existing is not None:
+            timestamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+            backup = target.with_name(
+                f"{target.name}.bak-{timestamp}-{uuid.uuid4().hex[:6]}"
+            )
+            runner(
+                [
+                    "sudo",
+                    "cp",
+                    "--preserve=mode,ownership,timestamps",
+                    str(target),
+                    str(backup),
+                ]
+            )
+            print(f"  preserved previous pack manager: {backup}")
+        runner(
+            [
+                "sudo",
+                "install",
+                "-o",
+                "root",
+                "-g",
+                "root",
+                "-m",
+                "0755",
+                str(source),
+                str(target),
+            ]
+        )
+        return target
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if existing is not None:
+        timestamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        backup = target.with_name(f"{target.name}.bak-{timestamp}-{uuid.uuid4().hex[:6]}")
+        shutil.copy2(target, backup)
+        print(f"  preserved previous pack manager: {backup}")
+    staging = target.with_name(f".{target.name}.staging-{uuid.uuid4().hex[:8]}")
+    try:
+        shutil.copy2(source, staging)
+        staging.chmod(0o755)
+        os.replace(staging, target)
+    finally:
+        staging.unlink(missing_ok=True)
+    return target
 
 
 def cleanup_bundle_artifacts(bundle_root: Path, manifest: Mapping[str, Any]) -> list[Path]:
@@ -1237,6 +1337,9 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"Service registry: {registry.get('data_path')}")
                 for command in _registry_commands(registry):
                     print("  " + shlex.join(command))
+            pack_manager = manifest.get("pack_manager")
+            if isinstance(pack_manager, dict):
+                print(f"Pack manager: {_expanded(str(pack_manager.get('install_path', '')))}")
             if args.keep_bundle:
                 print("Post-install cleanup: disabled by --keep-bundle")
             else:
@@ -1297,6 +1400,13 @@ def main(argv: list[str] | None = None) -> int:
             install_root,
             release,
             str(manifest["bundle_id"]),
+        )
+        pack_manager_path = install_pack_manager(
+            bundle_root,
+            manifest,
+            interactive=interactive,
+            input_fn=input,
+            runner=_default_runner,
         )
         if manifest.get("source", {}).get("dirty"):
             print("WARNING: this bundle contains uncommitted source changes.")
@@ -1414,6 +1524,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Current release: {current} -> {release}")
         print("Older releases remain under " + str(releases))
         print(f"Installed documentation: {support / 'launch-docs.py'}")
+        print(f"Installed pack manager: {pack_manager_path}")
         _print_capability(manifest)
         cleanup = not args.keep_bundle and (
             args.yes
