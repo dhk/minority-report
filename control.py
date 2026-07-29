@@ -281,17 +281,58 @@ def _print_status(host: str, port: int, *, stream: TextIO = sys.stdout) -> None:
     print(f"Health: {detail}", file=stream)
 
 
+def _print_urls(
+    host: str,
+    port: int,
+    tunnel_path: str | None,
+    tunnel_port: int | None,
+    *,
+    stream: TextIO = sys.stdout,
+) -> None:
+    from alexandria.infrastructure.config import load_config
+    from alexandria.mcp_server import (
+        _extra_allowed_hosts,
+        _http_token,
+        _tunnel_path,
+        _tunnel_port,
+        render_urls,
+    )
+
+    token = _http_token(load_config())
+    hosts = _extra_allowed_hosts(None)
+    for line in render_urls(
+        token,
+        hosts,
+        host=host,
+        port=port,
+        tunnel_path=_tunnel_path(tunnel_path),
+        tunnel_port=_tunnel_port(tunnel_port),
+    ):
+        print(line, file=stream)
+    if not hosts:
+        print(
+            "(no tunnel hostname detected — is Tailscale up, or is ALEXANDRIA_ALLOWED_HOSTS set?)",
+            file=stream,
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="alexandria-ctl")
     parser.add_argument("--repo", type=Path, default=_default_repo())
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
-    parser.add_argument("command", choices=["status", "start", "stop-all", "upgrade", "cycle"])
+    parser.add_argument("--tunnel-path", default=None)
+    parser.add_argument("--tunnel-port", type=int, default=None)
+    parser.add_argument(
+        "command", choices=["status", "url", "start", "stop-all", "upgrade", "cycle"]
+    )
     args = parser.parse_args(argv)
     repo = args.repo.expanduser().resolve()
     try:
         if args.command == "status":
             _print_status(args.host, args.port)
+        elif args.command == "url":
+            _print_urls(args.host, args.port, args.tunnel_path, args.tunnel_port)
         elif args.command == "start":
             return (
                 0

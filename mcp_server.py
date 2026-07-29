@@ -9,15 +9,18 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import json
 import logging
 import math
 import os
 import secrets
 import socket
+import subprocess
 import sys
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
+from typing import Any
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -374,13 +377,36 @@ def _http_token(config: Config, rotate: bool = False) -> str:
     return path.read_text(encoding="utf-8").strip()
 
 
+def _tailscale_dns_name(runner: Callable[..., Any] = subprocess.run) -> str | None:
+    """Return this machine's Tailscale DNS name when it can be detected.
+
+    Detection is deliberately best-effort: Alexandria must still start on a
+    machine without Tailscale or while the daemon is unavailable.
+    """
+    try:
+        process = runner(
+            ["tailscale", "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        name = json.loads(process.stdout)["Self"]["DNSName"]
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError, KeyError, TypeError):
+        return None
+    return str(name).rstrip(".") or None
+
+
 def _extra_allowed_hosts(
     cli_hosts: Sequence[str] | None,
     env: Mapping[str, str] | None = None,
+    tailscale: Callable[[], str | None] = _tailscale_dns_name,
 ) -> list[str]:
     env = os.environ if env is None else env
     merged = list(cli_hosts or [])
     merged.extend(env.get("ALEXANDRIA_ALLOWED_HOSTS", "").split(","))
+    detected = tailscale()
+    if detected:
+        merged.append(detected)
     ordered: dict[str, None] = {}
     for entry in merged:
         host = entry.strip().removeprefix("https://").removeprefix("http://").split("/", 1)[0]
@@ -389,19 +415,56 @@ def _extra_allowed_hosts(
     return list(ordered)
 
 
+def _tunnel_path(cli_value: str | None = None, env: Mapping[str, str] | None = None) -> str:
+    """External path used by a stripping tunnel such as Tailscale --set-path."""
+    env = os.environ if env is None else env
+    raw = cli_value if cli_value is not None else env.get("ALEXANDRIA_TUNNEL_PATH", "")
+    value = raw.strip().strip("/")
+    return f"/{value}" if value else ""
+
+
+def _tunnel_port(cli_value: int | None = None, env: Mapping[str, str] | None = None) -> int | None:
+    """External HTTPS port, independent from Alexandria's local bind port."""
+    if cli_value is not None:
+        return cli_value
+    env = os.environ if env is None else env
+    raw = env.get("ALEXANDRIA_TUNNEL_PORT", "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
 def connector_urls(
-    token: str, extra_hosts: Sequence[str], host: str = "127.0.0.1", port: int = 8797
+    token: str,
+    extra_hosts: Sequence[str],
+    host: str = "127.0.0.1",
+    port: int = 8797,
+    tunnel_path: str = "",
+    tunnel_port: int | None = None,
 ) -> list[tuple[str, str]]:
     pairs = [("MCP over HTTP", f"http://{host}:{port}/mcp/{token}")]
+    path = _tunnel_path(tunnel_path)
     for tunnel_host in extra_hosts:
-        pairs.append(("Tunnel MCP connector", f"https://{tunnel_host}/mcp/{token}"))
+        authority = tunnel_host if tunnel_port is None else f"{tunnel_host}:{tunnel_port}"
+        pairs.append(("Tunnel MCP connector", f"https://{authority}{path}/mcp/{token}"))
     return pairs
 
 
 def render_urls(
-    token: str, extra_hosts: Sequence[str], host: str = "127.0.0.1", port: int = 8797
+    token: str,
+    extra_hosts: Sequence[str],
+    host: str = "127.0.0.1",
+    port: int = 8797,
+    tunnel_path: str = "",
+    tunnel_port: int | None = None,
 ) -> list[str]:
-    return [f"{label}: {url}" for label, url in connector_urls(token, extra_hosts, host, port)]
+    return [
+        f"{label}: {url}"
+        for label, url in connector_urls(token, extra_hosts, host, port, tunnel_path, tunnel_port)
+    ]
 
 
 def build_transport_security(extra_hosts: Sequence[str]) -> TransportSecuritySettings:
@@ -453,7 +516,22 @@ def main(argv: list[str] | None = None) -> None:
         action="append",
         metavar="HOST",
         help="Extra Host header to accept over --http (repeatable). Merged with "
-        "ALEXANDRIA_ALLOWED_HOSTS (comma-separated).",
+        "ALEXANDRIA_ALLOWED_HOSTS (comma-separated) and this machine's "
+        "auto-detected Tailscale DNS name.",
+    )
+    parser.add_argument(
+        "--tunnel-path",
+        default=None,
+        help="External path used by a stripping tunnel (for example /alexandria with "
+        "tailscale funnel --set-path). Changes printed URLs, not the local route. "
+        "Falls back to ALEXANDRIA_TUNNEL_PATH.",
+    )
+    parser.add_argument(
+        "--tunnel-port",
+        type=int,
+        default=None,
+        help="External HTTPS port when it is not 443. Changes printed URLs, not the "
+        "local bind. Falls back to ALEXANDRIA_TUNNEL_PORT.",
     )
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO)
@@ -507,7 +585,14 @@ def main(argv: list[str] | None = None) -> None:
 
     register_health(server)
     register_admin(server)
-    for line in render_urls(token, extra_hosts, host=args.host, port=args.port):
+    for line in render_urls(
+        token,
+        extra_hosts,
+        host=args.host,
+        port=args.port,
+        tunnel_path=_tunnel_path(args.tunnel_path),
+        tunnel_port=_tunnel_port(args.tunnel_port),
+    ):
         print(line)
     print(
         "The URL is a capability — anyone holding it can read research/ and, after "
