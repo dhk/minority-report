@@ -37,7 +37,12 @@ from alexandria.commission import (
     RunStore,
 )
 from alexandria.commission_models import Brief, Draft
-from alexandria.infrastructure.config import Config, RepoNotFoundError, load_config
+from alexandria.infrastructure.config import (
+    Config,
+    HostEnvironmentError,
+    RepoNotFoundError,
+    load_config,
+)
 from alexandria.infrastructure.mcp_process import clear_pidfile, read_server_pid, write_pidfile
 from alexandria.infrastructure.research_repo import (
     LIFECYCLE_STAGES,
@@ -62,7 +67,7 @@ _STARTED_AT = datetime.now(UTC).isoformat()
 def _config_or_message() -> Config | str:
     try:
         return load_config()
-    except RepoNotFoundError as exc:
+    except (HostEnvironmentError, RepoNotFoundError) as exc:
         return str(exc)
 
 
@@ -543,7 +548,7 @@ def main(argv: list[str] | None = None) -> None:
         return
     try:
         config = load_config()
-    except RepoNotFoundError as exc:
+    except (HostEnvironmentError, RepoNotFoundError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(1)
     existing = read_server_pid(config)

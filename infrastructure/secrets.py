@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-import os
 from collections.abc import Mapping
 from pathlib import Path
 
+from alexandria.infrastructure.config import (
+    ENV_SECRETS_FILE,
+    resolve_host_environment,
+)
+
 ENV_OPENROUTER_KEY = "OPENROUTER_API_KEY"
-ENV_SECRETS_FILE = "ALEXANDRIA_SECRETS_FILE"
 DEFAULT_SECRETS_FILE = Path("~/.config/alexandria/secrets.env")
 
 
@@ -28,9 +31,13 @@ def _read_env_file(path: Path) -> dict[str, str]:
     return values
 
 
-def openrouter_api_key(env: Mapping[str, str] | None = None) -> str:
+def openrouter_api_key(
+    env: Mapping[str, str] | None = None,
+    *,
+    host_env_file: Path | None = None,
+) -> str:
     """Return the OpenRouter key from env or the configured local secrets file."""
-    environment = os.environ if env is None else env
+    environment, _, _ = resolve_host_environment(env, host_env_file=host_env_file)
     direct = environment.get(ENV_OPENROUTER_KEY, "").strip()
     if direct:
         return direct

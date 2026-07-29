@@ -7,6 +7,7 @@ import csv
 import html
 import io
 import json
+import sys
 import zipfile
 from collections.abc import Sequence
 from pathlib import Path
@@ -30,7 +31,12 @@ from alexandria.commission import (
     RunStore,
 )
 from alexandria.commission_models import Brief, Draft, InputArtifact, RunRecord
-from alexandria.infrastructure.config import Config, load_config
+from alexandria.infrastructure.config import (
+    Config,
+    HostEnvironmentError,
+    RepoNotFoundError,
+    load_config,
+)
 from alexandria.infrastructure.secrets import SecretNotFoundError, openrouter_api_key
 from alexandria.input_resolution import (
     GitHubResolver,
@@ -780,9 +786,15 @@ def create_app(config: Config | None = None) -> Starlette:
     return app
 
 
-def main(argv: list[str] | None = None) -> None:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="alexandria-web")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8042)
     args = parser.parse_args(argv)
-    uvicorn.run(create_app(), host=args.host, port=args.port)
+    try:
+        app = create_app()
+    except (HostEnvironmentError, RepoNotFoundError) as exc:
+        print(f"alexandria-web: {exc}", file=sys.stderr)
+        return 1
+    uvicorn.run(app, host=args.host, port=args.port)
+    return 0

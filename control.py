@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, TextIO
 
+from alexandria.infrastructure.config import ENV_REPO_ROOT, RepoNotFoundError, load_config
 from alexandria.version import service_version
 
 DEFAULT_HOST = "127.0.0.1"
@@ -42,11 +43,16 @@ class Runner(Protocol):
     def __call__(self, command: list[str], *, cwd: Path | None = None) -> None: ...
 
 
-def _default_repo(env: dict[str, str] | os._Environ[str] | None = None) -> Path:
-    environment = os.environ if env is None else env
-    configured = environment.get("ALEXANDRIA_REPO", "").strip()
-    if configured:
-        return Path(configured).expanduser().resolve()
+def _default_repo(
+    env: dict[str, str] | os._Environ[str] | None = None,
+    *,
+    host_env_file: Path | None = None,
+    cwd: Path | None = None,
+) -> Path:
+    try:
+        return load_config(env, cwd=cwd, host_env_file=host_env_file).repo_root.resolve()
+    except RepoNotFoundError:
+        pass
     return (Path.home() / "Documents/dev/alexandria").resolve()
 
 
@@ -287,9 +293,9 @@ def _print_urls(
     tunnel_path: str | None,
     tunnel_port: int | None,
     *,
+    repo: Path | None = None,
     stream: TextIO = sys.stdout,
 ) -> None:
-    from alexandria.infrastructure.config import load_config
     from alexandria.mcp_server import (
         _extra_allowed_hosts,
         _http_token,
@@ -298,7 +304,11 @@ def _print_urls(
         render_urls,
     )
 
-    token = _http_token(load_config())
+    environment = None
+    if repo is not None:
+        environment = dict(os.environ)
+        environment[ENV_REPO_ROOT] = str(repo.expanduser().resolve())
+    token = _http_token(load_config(environment))
     hosts = _extra_allowed_hosts(None)
     for line in render_urls(
         token,
@@ -318,7 +328,7 @@ def _print_urls(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="alexandria-ctl")
-    parser.add_argument("--repo", type=Path, default=_default_repo())
+    parser.add_argument("--repo", type=Path)
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--tunnel-path", default=None)
@@ -327,13 +337,22 @@ def main(argv: list[str] | None = None) -> int:
         "command", choices=["status", "url", "start", "stop-all", "upgrade", "cycle"]
     )
     args = parser.parse_args(argv)
-    repo = args.repo.expanduser().resolve()
     try:
+        repo = args.repo.expanduser().resolve() if args.repo else None
+        if args.command in {"start", "upgrade", "cycle"} and repo is None:
+            repo = _default_repo()
         if args.command == "status":
             _print_status(args.host, args.port)
         elif args.command == "url":
-            _print_urls(args.host, args.port, args.tunnel_path, args.tunnel_port)
+            _print_urls(
+                args.host,
+                args.port,
+                args.tunnel_path,
+                args.tunnel_port,
+                repo=args.repo,
+            )
         elif args.command == "start":
+            assert repo is not None
             return (
                 0
                 if start_server(
@@ -347,8 +366,10 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "stop-all":
             stop_all(use_systemd=systemd_unit_installed())
         elif args.command == "upgrade":
+            assert repo is not None
             upgrade(repo)
         elif args.command == "cycle":
+            assert repo is not None
             return 0 if cycle(repo, args.host, args.port) else 1
     except (OSError, RuntimeError, subprocess.CalledProcessError) as exc:
         print(f"alexandria-ctl: {exc}", file=sys.stderr)
