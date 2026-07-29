@@ -20,7 +20,7 @@ from typing import Protocol, TextIO
 from alexandria.version import service_version
 
 DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = 8787
+DEFAULT_PORT = 8797
 _SERVICE_UNIT = "alexandria-mcp.service"
 _PROCESS_GRACE_SECONDS = 5.0
 _HEALTH_WAIT_SECONDS = 10.0
@@ -132,6 +132,8 @@ def _health(host: str, port: int) -> tuple[bool, str]:
             payload = json.loads(response.read())
     except (OSError, urllib.error.URLError, ValueError):
         return False, f"unhealthy — {url} did not return Alexandria health"
+    if not isinstance(payload, dict) or payload.get("service") != "alexandria":
+        return False, f"unhealthy — {url} did not identify itself as Alexandria"
     return (
         True,
         f"healthy — v{payload.get('version', '?')} since {payload.get('started_at', '?')} ({url})",

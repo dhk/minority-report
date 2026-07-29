@@ -341,7 +341,9 @@ async def _health(request: Request) -> JSONResponse:
     """Unauthenticated, minimal JSON health check — what the admin
     installations page polls. Never put repository data in this.
     """
-    return JSONResponse({"version": service_version(), "started_at": _STARTED_AT})
+    return JSONResponse(
+        {"service": "alexandria", "version": service_version(), "started_at": _STARTED_AT}
+    )
 
 
 _health_registered = False
@@ -388,7 +390,7 @@ def _extra_allowed_hosts(
 
 
 def connector_urls(
-    token: str, extra_hosts: Sequence[str], host: str = "127.0.0.1", port: int = 8787
+    token: str, extra_hosts: Sequence[str], host: str = "127.0.0.1", port: int = 8797
 ) -> list[tuple[str, str]]:
     pairs = [("MCP over HTTP", f"http://{host}:{port}/mcp/{token}")]
     for tunnel_host in extra_hosts:
@@ -397,7 +399,7 @@ def connector_urls(
 
 
 def render_urls(
-    token: str, extra_hosts: Sequence[str], host: str = "127.0.0.1", port: int = 8787
+    token: str, extra_hosts: Sequence[str], host: str = "127.0.0.1", port: int = 8797
 ) -> list[str]:
     return [f"{label}: {url}" for label, url in connector_urls(token, extra_hosts, host, port)]
 
@@ -440,7 +442,7 @@ def main(argv: list[str] | None = None) -> None:
         default="127.0.0.1",
         help="Bind address for --http (default 127.0.0.1; non-loopback prints a warning).",
     )
-    parser.add_argument("--port", type=int, default=8787, help="Port for --http (default 8787).")
+    parser.add_argument("--port", type=int, default=8797, help="Port for --http (default 8797).")
     parser.add_argument(
         "--rotate-token",
         action="store_true",
