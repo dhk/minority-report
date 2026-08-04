@@ -1,0 +1,98 @@
+[pack]
+format_version = 1
+name = "alexandria"
+display_name = "Alexandria"
+default_install_root = "~/src/alexandria"
+repo_environment = "ALEXANDRIA_REPO"
+environment_file = "~/.config/alexandria/alexandria.env"
+environment = { ALEXANDRIA_DATA_DIR = "~/.local/share/alexandria", ALEXANDRIA_SECRETS_FILE = "~/.config/alexandria/secrets.env" }
+secrets_file = "~/.config/alexandria/secrets.env"
+required_secrets = ["OPENROUTER_API_KEY"]
+exclude = [
+  ".git/**",
+  ".scratch/**",
+  ".venv/**",
+  "dist/**",
+  "data/**",
+  "**/__pycache__/**",
+  "*.egg-info/**",
+]
+
+[[services]]
+unit = "alexandria-mcp.service"
+description = "Alexandria MCP server (streamable HTTP)"
+entrypoint = "alexandria-mcp"
+args = ["--http", "--port", "8797", "--tunnel-path", "/alexandria"]
+health_url = "http://127.0.0.1:8797/health"
+health_service = "alexandria"
+
+[capability]
+token_file = "~/.local/share/alexandria/mcp-http-token"
+urls = [
+  "https://{tailscale_dns}/alexandria/mcp/{token}",
+  "http://127.0.0.1:8797/mcp/{token}",
+]
+
+[tailscale]
+mode = "funnel"
+path = "/alexandria"
+target = "http://127.0.0.1:8797"
+port = 443
+required = true
+
+[registry]
+helper_path = "/usr/local/bin/service-registry"
+data_path = "/var/lib/common-services/registry.json"
+static_range = [8700, 8799]
+dynamic_range = [8800, 8999]
+required = true
+
+[[registry.entries]]
+service_id = "wingman"
+display_name = "Wingman"
+owner = "dhk"
+protocol = "tcp"
+address = "127.0.0.1"
+port = 8787
+unit = "wingman-mcp.service"
+source = "dhk/wingman"
+adopt_listener = true
+route_mode = "funnel"
+route_host = "tailscale-self"
+route_https_port = 443
+route_path = "/"
+route_target = "http://127.0.0.1:8787"
+
+[[registry.entries]]
+service_id = "wingman-trent"
+display_name = "Wingman (Trent)"
+owner = "trent"
+protocol = "tcp"
+address = "127.0.0.1"
+port = 8788
+unit = "wingman-mcp.service"
+source = "dhk/wingman"
+adopt_listener = true
+route_mode = "funnel"
+route_host = "tailscale-self"
+route_https_port = 443
+route_path = "/trent"
+route_target = "http://127.0.0.1:8788"
+
+[[registry.entries]]
+service_id = "alexandria"
+display_name = "Alexandria"
+owner = "dhk"
+protocol = "tcp"
+address = "127.0.0.1"
+port = 8797
+unit = "alexandria-mcp.service"
+health_url = "http://127.0.0.1:8797/health"
+health_service = "alexandria"
+source = "dhk/alexandria"
+adopt_listener = true
+route_mode = "funnel"
+route_host = "tailscale-self"
+route_https_port = 443
+route_path = "/alexandria"
+route_target = "http://127.0.0.1:8797"
