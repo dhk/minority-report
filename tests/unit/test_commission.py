@@ -136,6 +136,85 @@ async def test_without_web_search_no_plugin_field_is_sent() -> None:
     assert "plugins" not in sent[0]
 
 
+def _gateway_returning(body: str) -> OpenRouterGateway:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/models"):
+            return _pricing_response()
+        return httpx.Response(200, text=body)
+
+    client = httpx.AsyncClient(
+        base_url="https://openrouter.test", transport=httpx.MockTransport(handler)
+    )
+    return OpenRouterGateway("test-key", client)
+
+
+_COMPLETION_BODY = json.dumps(
+    {
+        "id": "gen-1",
+        "model": "alpha/model",
+        "choices": [{"message": {"content": "answer"}}],
+        "usage": {"cost": 0.01},
+    }
+)
+
+
+@pytest.mark.anyio
+async def test_keep_alive_padding_does_not_lose_a_billed_model() -> None:
+    # OpenRouter pads long-running non-streaming responses with SSE comment
+    # lines. The 200 is real and already billed, so the model must survive it.
+    padded = ": OPENROUTER PROCESSING\n" * 3 + _COMPLETION_BODY
+    async with _gateway_returning(padded) as gateway:
+        call = await gateway.complete("alpha/model", "prompt")
+
+    assert call.status == "success"
+    assert call.body == "answer"
+    assert call.cost == 0.01
+    assert call.generation_id == "gen-1"
+    # The padded bytes are preserved verbatim as received.
+    assert call.raw_response == padded
+
+
+@pytest.mark.anyio
+async def test_trailing_padding_and_surrounding_whitespace_are_tolerated() -> None:
+    async with _gateway_returning(
+        f"\n\n  {_COMPLETION_BODY}\n: OPENROUTER PROCESSING\n"
+    ) as gateway:
+        call = await gateway.complete("alpha/model", "prompt")
+
+    assert call.status == "success"
+    assert call.body == "answer"
+
+
+@pytest.mark.anyio
+async def test_a_genuinely_undecodable_body_still_fails_with_an_excerpt() -> None:
+    # Tolerating padding must not turn real garbage into a silent success.
+    async with _gateway_returning("<html>gateway timeout</html>") as gateway:
+        call = await gateway.complete("alpha/model", "prompt")
+
+    assert call.status == "failed"
+    assert call.status_code == 200
+    assert call.raw_response == "<html>gateway timeout</html>"
+    # The excerpt is what makes the next occurrence diagnosable at all.
+    assert "gateway timeout" in (call.error or "")
+
+
+@pytest.mark.anyio
+async def test_an_empty_body_is_a_failure_not_an_empty_answer() -> None:
+    async with _gateway_returning(": OPENROUTER PROCESSING\n") as gateway:
+        call = await gateway.complete("alpha/model", "prompt")
+
+    assert call.status == "failed"
+    assert not call.body
+
+
+@pytest.mark.anyio
+async def test_a_non_object_completion_body_fails_the_call_not_the_run() -> None:
+    async with _gateway_returning("[1, 2, 3]") as gateway:
+        call = await gateway.complete("alpha/model", "prompt")
+
+    assert call.status == "failed"
+
+
 @pytest.mark.anyio
 async def test_estimate_charges_for_each_searching_model() -> None:
     sent: list[dict[str, Any]] = []

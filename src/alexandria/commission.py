@@ -49,6 +49,36 @@ class CommissionError(RuntimeError):
     """A commission cannot safely advance to its next lifecycle state."""
 
 
+def _decode_openrouter_json(raw: str) -> Any:
+    """Parse an OpenRouter body, tolerating keep-alive padding around the JSON.
+
+    OpenRouter holds long-running connections open by emitting SSE comment
+    lines (``: OPENROUTER PROCESSING``) before the body, including on
+    non-streaming requests. ``httpx``'s ``.json()`` rejects the padded body, so
+    a 200 that OpenRouter had already billed us for was recorded as a failed
+    call and the model dropped out of the run — see issue #30.
+
+    Only leading comment lines are stripped, and decoding stops at the end of
+    the first JSON value, so trailing padding is ignored too. Neither step can
+    alter a valid JSON payload: a literal line-initial ``:`` cannot occur
+    inside one, because JSON strings escape their newlines.
+    """
+    text = raw.lstrip()
+    while text.startswith(":"):
+        _, _, text = text.partition("\n")
+        text = text.lstrip()
+    if not text:
+        raise ValueError("OpenRouter returned an empty body")
+    value, _end = json.JSONDecoder().raw_decode(text)
+    return value
+
+
+def _body_excerpt(raw: str, limit: int = 200) -> str:
+    """A short, single-line excerpt of a body, for diagnosing a decode failure."""
+    excerpt = raw[:limit].replace("\n", "\\n").replace("\r", "\\r")
+    return excerpt + "…" if len(raw) > limit else excerpt
+
+
 class Gateway(Protocol):
     async def estimate(
         self, models: list[str], input_tokens: int, *, web_search: bool = False
@@ -170,7 +200,7 @@ class OpenRouterGateway:
     ) -> float:
         response = await self.client.get("/models")
         response.raise_for_status()
-        payload = response.json()
+        payload = _decode_openrouter_json(response.text)
         rows = payload.get("data") if isinstance(payload, dict) else None
         if not isinstance(rows, list):
             raise CommissionError("OpenRouter returned an unexpected model-list response.")
@@ -225,7 +255,9 @@ class OpenRouterGateway:
                 status_code=response.status_code,
             )
         try:
-            payload = response.json()
+            payload = _decode_openrouter_json(raw)
+            if not isinstance(payload, dict):
+                raise TypeError("completion response is not a JSON object")
             choices = payload.get("choices")
             first = choices[0] if isinstance(choices, list) and choices else {}
             message = first.get("message") if isinstance(first, dict) else {}
@@ -240,7 +272,7 @@ class OpenRouterGateway:
                         "/generation", params={"id": resolved_generation_id}
                     )
                     generation.raise_for_status()
-                    generation_payload = generation.json()
+                    generation_payload = _decode_openrouter_json(generation.text)
                     generation_data = (
                         generation_payload.get("data")
                         if isinstance(generation_payload, dict)
@@ -269,7 +301,7 @@ class OpenRouterGateway:
                 raw_response=raw,
                 generation_id=generation_id,
                 latency_ms=latency_ms,
-                error=f"Invalid OpenRouter response: {exc}",
+                error=(f'Invalid OpenRouter response: {exc} (body starts: "{_body_excerpt(raw)}")'),
                 status_code=response.status_code,
             )
 
