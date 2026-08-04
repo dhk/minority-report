@@ -1,0 +1,261 @@
+import io
+import json
+import subprocess
+import sys
+import zipfile
+from datetime import UTC, datetime
+from pathlib import Path
+
+from starlette.testclient import TestClient
+
+from alexandria.commission import RunStore
+from alexandria.commission_models import InputArtifact, RunRecord
+from alexandria.infrastructure.config import Config
+from alexandria.web import create_app
+
+
+def _result_client(tmp_path: Path) -> tuple[TestClient, str, str]:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config = Config(
+        data_dir=tmp_path / "state",
+        data_dir_source="test",
+        repo_root=repo,
+        repo_root_source="test",
+    )
+    run_id = "r-2026-0728-01"
+    run = RunRecord(
+        run_id=run_id,
+        brief_revision="B",
+        brief_sha256="abc123",
+        status="partial",
+        created_at=datetime(2026, 7, 28, 12, tzinfo=UTC),
+        completed_at=datetime(2026, 7, 28, 12, 3, tzinfo=UTC),
+        cost_actual=0.42,
+        elapsed_seconds=184,
+        inputs=[
+            InputArtifact(
+                name="brief.md",
+                format="md",
+                bytes=12,
+                extracted_chars=12,
+                encoding="utf-8",
+                sha256="input123",
+                state="extracted",
+                extraction_method="text-decode",
+            )
+        ],
+        dispatched_models=["alpha/model", "beta/model"],
+        grading_model="grader/model",
+        limitations=["Beta failed after one provider error."],
+    )
+    store = RunStore(config.data_dir)
+    store.write_run(run)
+    run_dir = store.run_dir(run_id)
+    (run_dir / "raw").mkdir()
+    (run_dir / "brief.md").write_text(
+        "Task\nShould Alexandria render its report?\n\nContext\nOperator review.",
+        encoding="utf-8",
+    )
+    report = (
+        "## Recommendation\n\nRender **the report** beside its artifact card.\n\n"
+        "### What this run does not establish\n\nAgreement is not verification.\n\n"
+        "<script>unsafe()</script>\n"
+    )
+    (run_dir / "report.md").write_text(report, encoding="utf-8")
+    (run_dir / "claims.json").write_text(
+        json.dumps(
+            [
+                {
+                    "claim_id": "c-001",
+                    "text": "The report is readable.",
+                    "group": "novel",
+                    "responding_model_count": 1,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "scores.csv").write_text(
+        "claim_id,model_id,score,quote,grading_call_id\n"
+        "c-001,alpha/model,0,,grader-1\n"
+        "c-001,beta/model,,,\n",
+        encoding="utf-8",
+    )
+    (run_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "brief_revision": "B",
+                "brief_sha256": "abc123",
+                "artifacts": ["report.md", "claims.json", "scores.csv", "raw/"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "raw" / "alpha-model.json").write_text(
+        json.dumps(
+            {
+                "model_id": "alpha/model",
+                "resolved_model_id": "alpha/model-v1",
+                "status": "success",
+                "raw_response": "alpha raw response",
+                "prompt_tokens": 100,
+                "completion_tokens": 50,
+                "cost": 0.4,
+                "latency_ms": 1000,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "raw" / "beta-model.json").write_text(
+        json.dumps(
+            {
+                "model_id": "beta/model",
+                "status": "failed",
+                "error": "502 from provider",
+                "latency_ms": 900,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return TestClient(create_app(config)), run_id, report
+
+
+def test_result_defaults_to_the_claim_landscape_and_preserves_honesty_states(
+    tmp_path: Path,
+) -> None:
+    client, run_id, _ = _result_client(tmp_path)
+
+    response = client.get(f"/runs/{run_id}")
+
+    assert response.status_code == 200
+    assert "Should Alexandria render its report?" in response.text
+    assert "partial with 1 failed call" in response.text
+    assert 'aria-current="page">Claim landscape</a>' in response.text
+    assert "—" in response.text
+    assert "✕" in response.text
+    assert "call failed; no output exists to grade" in response.text.lower()
+    assert "Novel · 1/2" in response.text
+
+
+def test_report_tab_renders_safe_markdown_and_artifact_actions(tmp_path: Path) -> None:
+    client, run_id, _ = _result_client(tmp_path)
+
+    response = client.get(f"/runs/{run_id}?tab=report")
+
+    assert response.status_code == 200
+    assert 'aria-current="page">Report</a>' in response.text
+    assert "<h2>Recommendation</h2>" in response.text
+    assert "Render <strong>the report</strong>" in response.text
+    assert "<h3>What this run does not establish</h3>" in response.text
+    assert "&lt;script&gt;unsafe()&lt;/script&gt;" in response.text
+    assert "data-copy-markdown" in response.text
+    assert f"/runs/{run_id}/bundle.zip" in response.text
+
+
+def test_heatmap_tab_color_codes_canonical_claims_without_fabricating_prose_spans(
+    tmp_path: Path,
+) -> None:
+    client, run_id, _ = _result_client(tmp_path)
+
+    response = client.get(f"/runs/{run_id}?tab=heatmap")
+
+    assert response.status_code == 200
+    assert 'aria-current="page">Heatmap document</a>' in response.text
+    assert 'class="claim-block group-novel"' in response.text
+    assert "The report is readable." in response.text
+    assert "alpha/model" in response.text
+    assert "beta/model" in response.text
+    assert "—" in response.text
+    assert "✕" in response.text
+    assert "does not pretend to highlight words" in response.text
+    assert f"/runs/{run_id}/heatmap.html" in response.text
+
+
+def test_standalone_heatmap_is_safe_and_explains_its_semantics(tmp_path: Path) -> None:
+    client, run_id, _ = _result_client(tmp_path)
+
+    response = client.get(f"/runs/{run_id}/heatmap.html")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")
+    assert "<h1>Claim heatmap</h1>" in response.text
+    assert 'class="claim-block group-novel"' in response.text
+    assert "relationship among model responses, not factual truth" in response.text
+    assert "— responded, no bearing" in response.text
+    assert "✕ call failed" in response.text
+
+
+def test_report_source_and_bundle_preserve_the_run_artifacts(tmp_path: Path) -> None:
+    client, run_id, report = _result_client(tmp_path)
+
+    source = client.get(f"/runs/{run_id}/report.md")
+    bundle = client.get(f"/runs/{run_id}/bundle.zip")
+
+    assert source.status_code == 200
+    assert source.text == report
+    assert source.headers["content-type"].startswith("text/markdown")
+    assert bundle.status_code == 200
+    assert bundle.headers["content-type"] == "application/zip"
+    with zipfile.ZipFile(io.BytesIO(bundle.content)) as archive:
+        names = set(archive.namelist())
+        report_html = archive.read(f"{run_id}/report.html").decode()
+        heatmap_html = archive.read(f"{run_id}/heatmap.html").decode()
+        runner = archive.getinfo(f"{run_id}/open-report.py")
+    assert f"{run_id}/report.md" in names
+    assert f"{run_id}/report.html" in names
+    assert f"{run_id}/heatmap.html" in names
+    assert f"{run_id}/open-report.py" in names
+    assert f"{run_id}/HOW-TO-READ.txt" in names
+    assert f"{run_id}/manifest.json" in names
+    assert f"{run_id}/raw/alpha-model.json" in names
+    assert "Render <strong>the report</strong>" in report_html
+    assert "&lt;script&gt;unsafe()&lt;/script&gt;" in report_html
+    assert "<h1>Claim heatmap</h1>" in heatmap_html
+    assert "The report is readable." in heatmap_html
+    assert runner.external_attr >> 16 & 0o777 == 0o755
+
+
+def test_downloaded_bundle_runner_opens_both_standalone_documents(tmp_path: Path) -> None:
+    client, run_id, _ = _result_client(tmp_path)
+    response = client.get(f"/runs/{run_id}/bundle.zip")
+    extracted = tmp_path / "download"
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        archive.extractall(extracted)
+
+    completed = subprocess.run(
+        [sys.executable, str(extracted / run_id / "open-report.py"), "--no-browser"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    heatmap = subprocess.run(
+        [
+            sys.executable,
+            str(extracted / run_id / "open-report.py"),
+            "--heatmap",
+            "--no-browser",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "Document: file://" in completed.stdout
+    assert completed.stdout.rstrip().endswith("report.html")
+    assert "Document: file://" in heatmap.stdout
+    assert heatmap.stdout.rstrip().endswith("heatmap.html")
+
+
+def test_raw_and_provenance_tabs_state_missing_and_preserved_data(tmp_path: Path) -> None:
+    client, run_id, _ = _result_client(tmp_path)
+
+    raw = client.get(f"/runs/{run_id}?tab=raw")
+    provenance = client.get(f"/runs/{run_id}?tab=provenance")
+
+    assert "alpha/model-v1" in raw.text
+    assert "502 from provider" in raw.text
+    assert "brief sha256" in provenance.text.lower()
+    assert "Beta failed after one provider error." in provenance.text
+    assert "it does not verify that claim" in provenance.text

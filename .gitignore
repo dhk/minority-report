@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.scratch/
+dist/
+
+# Local server state (see .env.example) — never version-controlled.
+/data/
+mcp-http-token
+installations-token
+mcp-http.pid
+
+# Editors / OS
+.DS_Store
