@@ -237,11 +237,31 @@ def _draft_review(draft: Draft) -> str:
             "The run may still be dispatched; the OpenRouter key limit is the active ceiling."
         )
     else:
-        estimate = f"${draft.estimate_usd:.4f} maximum"
+        # Not "maximum". Runs have come in at ~2x this figure, so calling it a
+        # ceiling made the one step that costs real money misleading
+        # (dhk/alexandria#32). The hard ceiling below is the only real bound.
+        estimate = f"${draft.estimate_usd:.4f}"
         pricing_note = (
             "Dispatch is blocked because the estimate exceeds the hard ceiling."
             if draft.estimate_usd > draft.ceiling_usd
             else "The estimate is within the hard ceiling."
+        )
+    estimate_lines: list[str] = []
+    detail = draft.estimate_detail
+    if detail is not None:
+        models = detail.research_model_count
+        rows = [("research", f"{models} models", detail.research_usd)]
+        if detail.web_search_usd:
+            rows.append(("web search", f"{models} searches", detail.web_search_usd))
+        rows.append(("grading", "1 model", detail.grading_usd))
+        estimate_lines = [
+            f"  {label:<11}{basis:<12}{f'${amount:.4f}':>8}" for label, basis, amount in rows
+        ]
+        estimate_lines.append(
+            f"  assumes {detail.assumed_completion_tokens:,} completion tokens per model."
+        )
+        estimate_lines.append(
+            "  Not covered: longer answers, retries, and calls that fail after billing."
         )
     input_lines = [
         (
@@ -261,7 +281,8 @@ def _draft_review(draft: Draft) -> str:
             "Research draft ready — no provider model calls have been dispatched.",
             f"Draft: {draft.draft_id}",
             f"Estimate: {estimate}",
-            f"Hard ceiling: ${draft.ceiling_usd:.2f}",
+            *estimate_lines,
+            f"Hard ceiling: ${draft.ceiling_usd:.2f} — the only bound that is enforced.",
             pricing_note,
             "",
             "Inputs:",

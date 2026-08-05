@@ -22,6 +22,8 @@ from alexandria.commission_models import (
     CallRecord,
     ClaimGroup,
     ClaimRecord,
+    CostActual,
+    CostEstimate,
     Draft,
     InputArtifact,
     RunRecord,
@@ -43,6 +45,10 @@ DEFAULT_GRADING_MODEL = "anthropic/claude-sonnet-4.6"
 WEB_PLUGIN_MAX_RESULTS = 5
 # Exa (the default engine) bills $0.005 per request for up to 10 results.
 WEB_SEARCH_COST_USD = 0.005
+# The estimate prices a nominal completion per model. Real research answers
+# routinely run longer, which is the single largest reason a run lands above
+# its estimate -- recorded on every run so the gap can be measured, not guessed.
+ASSUMED_COMPLETION_TOKENS = 2_000
 
 
 class CommissionError(RuntimeError):
@@ -214,7 +220,7 @@ class OpenRouterGateway:
             prompt = float(pricing.get("prompt") or 0)
             completion = float(pricing.get("completion") or 0)
             request = float(pricing.get("request") or 0)
-            total += input_tokens * prompt + 2_000 * completion + request
+            total += input_tokens * prompt + ASSUMED_COMPLETION_TOKENS * completion + request
             if web_search:
                 total += WEB_SEARCH_COST_USD
         return round(total, 6)
@@ -304,6 +310,36 @@ class OpenRouterGateway:
                 error=(f'Invalid OpenRouter response: {exc} (body starts: "{_body_excerpt(raw)}")'),
                 status_code=response.status_code,
             )
+
+
+def _sum_optional(values: list[int | None]) -> int | None:
+    known = [value for value in values if value is not None]
+    return sum(known) if known else None
+
+
+def _cost_actual(calls: list[CallRecord], grading_call: CallRecord | None) -> CostActual:
+    """Measure what a run really cost, in the same shape as its estimate.
+
+    Every dispatched call counts, including the ones that failed: a model that
+    errored after billable output still spent money, and dropping it here is
+    exactly how an overrun stays invisible.
+    """
+    every_call = [call for call in [*calls, grading_call] if call is not None]
+    research_costs = [call.cost for call in calls if call.cost is not None]
+    grading_cost = grading_call.cost if grading_call else None
+    totals = [call.cost for call in every_call if call.cost is not None]
+    return CostActual(
+        research_usd=round(sum(research_costs), 6) if research_costs else None,
+        grading_usd=grading_cost,
+        total_usd=round(sum(totals), 6) if totals else None,
+        research_prompt_tokens=_sum_optional([call.prompt_tokens for call in calls]),
+        research_completion_tokens=_sum_optional([call.completion_tokens for call in calls]),
+        grading_prompt_tokens=grading_call.prompt_tokens if grading_call else None,
+        grading_completion_tokens=grading_call.completion_tokens if grading_call else None,
+        billed_call_count=len(totals),
+        failed_call_count=sum(1 for call in every_call if call.status == "failed"),
+        unpriced_call_count=sum(1 for call in every_call if call.cost is None),
+    )
 
 
 def _optional_int(value: object) -> int | None:
@@ -449,15 +485,29 @@ class CommissionService:
             1, (sum(item.extracted_chars for item in inputs) + len(brief.verbatim())) // 4
         )
         estimate: float | None = None
+        estimate_detail: CostEstimate | None = None
         pricing_error: str | None = None
+        grading_input_tokens = input_tokens + ASSUMED_COMPLETION_TOKENS * len(models)
         try:
             research_estimate = await self.gateway.estimate(
                 models, input_tokens, web_search=web_search
             )
             # Grading reads the research bodies; it never searches.
-            grading_input_tokens = input_tokens + 2_000 * len(models)
             grading_estimate = await self.gateway.estimate([grading_model], grading_input_tokens)
+            # estimate() folds search into its total; split it back out rather
+            # than pricing twice, so the operator can see which term is which.
+            search_estimate = WEB_SEARCH_COST_USD * len(models) if web_search else 0.0
             estimate = round(research_estimate + grading_estimate, 6)
+            estimate_detail = CostEstimate(
+                research_usd=round(research_estimate - search_estimate, 6),
+                grading_usd=round(grading_estimate, 6),
+                web_search_usd=round(search_estimate, 6),
+                total_usd=estimate,
+                input_tokens=input_tokens,
+                grading_input_tokens=grading_input_tokens,
+                assumed_completion_tokens=ASSUMED_COMPLETION_TOKENS,
+                research_model_count=len(models),
+            )
         except (httpx.HTTPError, CommissionError, ValueError) as exc:
             pricing_error = str(exc)
         draft = Draft(
@@ -469,6 +519,7 @@ class CommissionService:
             grading_model=grading_model,
             ceiling_usd=ceiling_usd,
             estimate_usd=estimate,
+            estimate_detail=estimate_detail,
             pricing_error=pricing_error,
             web_search=web_search,
         )
@@ -576,6 +627,25 @@ class CommissionService:
         _write_atomic(run_dir / "report.md", (report.rstrip() + "\n").encode())
 
         completed = datetime.now(UTC)
+        actual = _cost_actual(calls, grading_call)
+        # Predicted and measured, side by side and per component. One run cannot
+        # correct the estimate; a corpus of these can (dhk/alexandria#32).
+        _write_atomic(
+            run_dir / "cost.json",
+            _json_bytes(
+                {
+                    "run_id": run_id,
+                    "estimate": draft.estimate_detail.model_dump(mode="json")
+                    if draft.estimate_detail
+                    else None,
+                    "estimate_total_usd": draft.estimate_usd,
+                    "actual": actual.model_dump(mode="json"),
+                    "web_search": draft.web_search,
+                    "dispatched_models": draft.models,
+                    "grading_model": draft.grading_model,
+                }
+            ),
+        )
         known_costs = [
             call.cost for call in [*calls, grading_call] if call and call.cost is not None
         ]
@@ -615,6 +685,7 @@ class CommissionService:
                 "claims.json",
                 "scores.csv",
                 "report.md",
+                "cost.json",
                 "manifest.json",
                 "raw/",
                 "inputs/",
