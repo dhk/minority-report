@@ -49,6 +49,11 @@ WEB_SEARCH_COST_USD = 0.005
 # routinely run longer, which is the single largest reason a run lands above
 # its estimate -- recorded on every run so the gap can be measured, not guessed.
 ASSUMED_COMPLETION_TOKENS = 2_000
+# The corpus owns this contract: dhk/alexandria's schemas/claim-score.schema.json.
+# Mirrored here because dispatch must enforce it without a corpus checkout to hand;
+# tests/unit/test_corpus_contract.py fails if the two ever disagree.
+SCORE_MIN = -3
+SCORE_MAX = 3
 
 
 class CommissionError(RuntimeError):
@@ -423,8 +428,10 @@ def _claims_and_scores(
             row = by_index.get(model_index, {})
             raw_score = row.get("score", 0)
             score = int(raw_score) if isinstance(raw_score, int | float | str) else 0
-            if score < -3 or score > 3:
-                raise ValueError(f"score outside -3..3 for {claim_id}/{model_id}")
+            if score < SCORE_MIN or score > SCORE_MAX:
+                raise ValueError(
+                    f"score outside {SCORE_MIN}..{SCORE_MAX} for {claim_id}/{model_id}"
+                )
             quote = str(row.get("quote") or "").strip() or None
             if score != 0 and not quote:
                 raise ValueError(f"non-zero score has no quote for {claim_id}/{model_id}")
