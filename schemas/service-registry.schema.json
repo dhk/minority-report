@@ -1,0 +1,219 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/dhk/minority-report/schemas/service-registry.schema.json",
+  "title": "Host service endpoint registry",
+  "description": "Version 1 of the host-wide registry governed by RFC-0006.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "format_version",
+    "updated_at",
+    "port_ranges",
+    "services"
+  ],
+  "properties": {
+    "format_version": {
+      "const": 1
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "port_ranges": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "static",
+        "dynamic"
+      ],
+      "properties": {
+        "static": {
+          "$ref": "#/$defs/portRange"
+        },
+        "dynamic": {
+          "$ref": "#/$defs/portRange"
+        }
+      }
+    },
+    "services": {
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^[a-z0-9][a-z0-9._-]*$"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/service"
+      }
+    }
+  },
+  "$defs": {
+    "port": {
+      "type": "integer",
+      "minimum": 1024,
+      "maximum": 49151
+    },
+    "portRange": {
+      "type": "array",
+      "prefixItems": [
+        {
+          "$ref": "#/$defs/port"
+        },
+        {
+          "$ref": "#/$defs/port"
+        }
+      ],
+      "items": false,
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "endpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol",
+        "address",
+        "port",
+        "allocation"
+      ],
+      "properties": {
+        "protocol": {
+          "const": "tcp"
+        },
+        "address": {
+          "enum": [
+            "127.0.0.1",
+            "::1",
+            "localhost"
+          ]
+        },
+        "port": {
+          "$ref": "#/$defs/port"
+        },
+        "allocation": {
+          "enum": [
+            "static",
+            "dynamic"
+          ]
+        }
+      }
+    },
+    "health": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "required": [
+        "url",
+        "service"
+      ],
+      "properties": {
+        "url": {
+          "type": "string",
+          "format": "uri"
+        },
+        "service": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "route": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "host",
+        "https_port",
+        "path",
+        "target"
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "serve",
+            "funnel"
+          ]
+        },
+        "host": {
+          "type": "string",
+          "minLength": 1
+        },
+        "https_port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "path": {
+          "type": "string",
+          "pattern": "^/"
+        },
+        "target": {
+          "type": "string",
+          "format": "uri"
+        }
+      }
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "service_id",
+        "display_name",
+        "owner",
+        "unit",
+        "source",
+        "endpoint",
+        "health",
+        "route",
+        "created_at",
+        "updated_at"
+      ],
+      "properties": {
+        "service_id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._-]*$"
+        },
+        "display_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "owner": {
+          "type": "string",
+          "minLength": 1
+        },
+        "unit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "endpoint": {
+          "$ref": "#/$defs/endpoint"
+        },
+        "health": {
+          "$ref": "#/$defs/health"
+        },
+        "route": {
+          "$ref": "#/$defs/route"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    }
+  }
+}
