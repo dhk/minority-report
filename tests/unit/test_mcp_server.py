@@ -1,5 +1,6 @@
 import json
 import re
+import socket
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Self, cast
@@ -189,6 +190,47 @@ def test_transport_security_always_includes_loopback() -> None:
     settings = build_transport_security(["tunnel.example"])
     assert "127.0.0.1:*" in settings.allowed_hosts
     assert settings.enable_dns_rebinding_protection is True
+
+
+def _port_left_in_time_wait() -> int:
+    """Return a port the kernel is holding in TIME_WAIT.
+
+    Reproduces what a disconnecting MCP client does to the server: a
+    connection is accepted and then closed by the *server* side, which is
+    what puts that side into TIME_WAIT holding the local port.
+    """
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = int(listener.getsockname()[1])
+    client = socket.create_connection(("127.0.0.1", port))
+    served, _ = listener.accept()
+    served.close()
+    client.close()
+    listener.close()
+    return port
+
+
+def test_port_probe_ignores_time_wait_left_by_a_disconnected_client() -> None:
+    """The probe must not refuse a port uvicorn would bind.
+
+    Without SO_REUSEADDR this fails for as long as TIME_WAIT lasts — 62s
+    measured on lobster — which is what failed two installs whose only
+    fault was that a client had been connected.
+    """
+    port = _port_left_in_time_wait()
+    assert mcp_server._port_available("127.0.0.1", port) is None
+
+
+def test_port_probe_still_rejects_a_live_listener() -> None:
+    """SO_REUSEADDR must not blind the probe to the case it exists for."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = int(listener.getsockname()[1])
+        assert mcp_server._port_available("127.0.0.1", port) is not None
 
 
 def test_http_mode_exits_cleanly_when_repo_not_found(
