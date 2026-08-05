@@ -259,3 +259,39 @@ def test_raw_and_provenance_tabs_state_missing_and_preserved_data(tmp_path: Path
     assert "brief sha256" in provenance.text.lower()
     assert "Beta failed after one provider error." in provenance.text
     assert "it does not verify that claim" in provenance.text
+
+
+def _discoverability_config(tmp_path: Path) -> Config:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    return Config(
+        data_dir=tmp_path / "state",
+        data_dir_source="test",
+        repo_root=repo,
+        repo_root_source="test",
+    )
+
+
+def test_homepage_lists_no_investigations_when_research_dir_is_empty(tmp_path: Path) -> None:
+    client = TestClient(create_app(_discoverability_config(tmp_path)))
+
+    response = client.get("/")
+
+    assert "No research investigations yet." in response.text
+
+
+def test_homepage_links_each_investigation_to_its_flow_view(tmp_path: Path) -> None:
+    # The flow view had no path to it from anywhere in the app -- reachable
+    # only if you already knew the URL.
+    config = _discoverability_config(tmp_path)
+    investigation = config.repo_root / "research" / "example-slug"
+    investigation.mkdir(parents=True)
+    (investigation / "topic.yaml").write_text(
+        "title: An example investigation\nassurance_level: bronze\n", encoding="utf-8"
+    )
+    client = TestClient(create_app(config))
+
+    response = client.get("/")
+
+    assert '<a href="/flow/example-slug">An example investigation</a>' in response.text
+    assert "bronze" in response.text

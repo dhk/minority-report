@@ -195,3 +195,55 @@ def test_flow_document_json_is_json_safe_and_has_six_stages(config: Config) -> N
     reloaded = json.loads(serialized)
     assert len(reloaded["stages"]) == 6
     assert reloaded["idea_slug"] == "idea-shipped"
+
+
+def _freeform_investigation(tmp_path: Path, brief_text: str) -> Config:
+    investigation = tmp_path / "research" / "freeform-slug"
+    (investigation / "01-brief").mkdir(parents=True)
+    (investigation / "topic.yaml").write_text("title: Freeform\n", encoding="utf-8")
+    (investigation / "01-brief" / "brief.md").write_text(brief_text, encoding="utf-8")
+    return _config(tmp_path)
+
+
+def test_a_freeform_brief_is_a_second_valid_shape_not_an_absence(tmp_path: Path) -> None:
+    # A real investigation's brief is human-written markdown, not
+    # Brief.verbatim()'s four sections. Rendering it as "not recorded" would
+    # misstate substantial content as missing.
+    config = _freeform_investigation(
+        tmp_path, "# License and dependency purpose-compatibility auditing\n\nBody text.\n"
+    )
+
+    document = build_flow_document(config, "freeform-slug")
+
+    assert document is not None
+    brief = next(stage for stage in document.stages if stage.key == "brief")
+    assert brief.state == "present"
+    assert brief.headline == "License and dependency purpose-compatibility auditing"
+    assert all("Not structured as" in lane.summary for lane in brief.lanes)
+
+
+def test_a_freeform_brief_without_a_heading_falls_back_to_its_first_line(
+    tmp_path: Path,
+) -> None:
+    config = _freeform_investigation(tmp_path, "\n\nFirst real line of the brief.\nMore.\n")
+
+    document = build_flow_document(config, "freeform-slug")
+
+    assert document is not None
+    brief = next(stage for stage in document.stages if stage.key == "brief")
+    assert brief.headline == "First real line of the brief."
+
+
+def test_a_task_shaped_brief_still_uses_its_task_section(tmp_path: Path) -> None:
+    config = _freeform_investigation(
+        tmp_path,
+        "Task\nAssess the provider port.\n\nContext\nSome context.\n\n"
+        "Constraints\nNone.\n\nOutput needs\nA report.\n",
+    )
+
+    document = build_flow_document(config, "freeform-slug")
+
+    assert document is not None
+    brief = next(stage for stage in document.stages if stage.key == "brief")
+    assert brief.headline == "Assess the provider port."
+    assert not any("Not structured as" in lane.summary for lane in brief.lanes)
