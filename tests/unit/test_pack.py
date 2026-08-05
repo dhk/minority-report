@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tomllib
 from pathlib import Path
 from typing import Self
 
@@ -25,12 +26,14 @@ from deploy.install import (
     _install_registry_helper,
     _print_capability,
     _registry_commands,
+    _resolve_external_repo,
     _tailscale_command,
     _write_units,
     bundle_cleanup_targets,
     cleanup_bundle_artifacts,
     ensure_environment_file,
     ensure_secrets,
+    existing_environment_value,
     install_root_needs_adoption,
     install_support,
     mark_install_root,
@@ -886,3 +889,45 @@ def test_docs_index_contains_toggle_driven_component_front_panel(tmp_path: Path)
     assert "Opening this panel runs local" in index
     assert "fetch('/__pack/checks'" in index
     assert "panel.addEventListener('toggle'" in index
+
+
+def test_existing_environment_value_reads_a_quoted_setting(tmp_path: Path) -> None:
+    env_file = tmp_path / "alexandria.env"
+    env_file.write_text(
+        "# comment\nALEXANDRIA_DATA_DIR=/somewhere\nALEXANDRIA_REPO='/home/dhk/corpus'\n",
+        encoding="utf-8",
+    )
+
+    assert existing_environment_value(env_file, "ALEXANDRIA_REPO") == "/home/dhk/corpus"
+    assert existing_environment_value(env_file, "NOT_SET") is None
+    assert existing_environment_value(tmp_path / "absent.env", "ALEXANDRIA_REPO") is None
+
+
+def test_external_repo_prefers_the_explicit_flag(tmp_path: Path) -> None:
+    resolved = _resolve_external_repo(tmp_path / "flagged", "/ignored/existing")
+
+    assert resolved == (tmp_path / "flagged").resolve()
+
+
+def test_external_repo_falls_back_to_what_the_operator_already_configured() -> None:
+    resolved = _resolve_external_repo(None, "~/corpus")
+
+    assert resolved == (Path.home() / "corpus").resolve()
+
+
+def test_external_repo_refuses_to_invent_a_default() -> None:
+    # The caller turns None into a hard error. Returning any path here would
+    # reintroduce the bug this exists to prevent: a healthy server quietly
+    # serving a frozen copy of the corpus from inside its own release.
+    assert _resolve_external_repo(None, None) is None
+    assert _resolve_external_repo(None, "") is None
+
+
+def test_pack_toml_keeps_the_corpus_outside_the_install_root() -> None:
+    # Regression guard: this pack's data repository is dhk/alexandria, a
+    # different repo from the one being installed.
+    config = tomllib.loads(
+        (Path(__file__).resolve().parents[2] / "deploy" / "pack.toml").read_text(encoding="utf-8")
+    )
+
+    assert config["pack"]["repo_is_install_root"] is False

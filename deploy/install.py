@@ -152,6 +152,31 @@ def render_environment_file(existing: str, managed: Mapping[str, str]) -> str:
     return "\n".join(rendered).rstrip("\n") + "\n"
 
 
+def existing_environment_value(path: Path, name: str) -> str | None:
+    """Read one setting out of an existing host environment file, if present."""
+    if not path.is_file():
+        return None
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        if key.strip() == name:
+            return value.strip().strip("\"'") or None
+    return None
+
+
+def _resolve_external_repo(flag_value: Path | None, existing: str | None) -> Path | None:
+    """Pick the data-repository path: explicit flag first, then what the
+    operator already configured. Never a default -- see the caller.
+    """
+    if flag_value is not None:
+        return flag_value.expanduser().resolve()
+    if existing:
+        return Path(existing).expanduser().resolve()
+    return None
+
+
 def ensure_environment_file(path: Path, managed: Mapping[str, str]) -> Path | None:
     """Write canonical host config atomically, backing up any changed file."""
     existing = path.read_text(encoding="utf-8") if path.is_file() else ""
@@ -782,6 +807,12 @@ def main(argv: list[str] | None = None) -> int:
         description="Install or upgrade this tool bundle with recoverable releases.",
     )
     parser.add_argument("--install-root", type=Path)
+    parser.add_argument(
+        "--repo-path",
+        type=Path,
+        help="Path to the data repository this service reads, for packs whose data "
+        "lives outside the install root. Preserved across upgrades once set.",
+    )
     parser.add_argument("--yes", action="store_true", help="accept defaults; never prompt")
     parser.add_argument("--skip-service", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -825,7 +856,26 @@ def main(argv: list[str] | None = None) -> int:
             name: str(_expanded(value)) if value.startswith(("~", "/")) else value
             for name, value in raw_environment.items()
         }
-        managed_environment[str(install["repo_environment"])] = str(current)
+        repo_variable = str(install["repo_environment"])
+        if bool(install.get("repo_is_install_root", True)):
+            managed_environment[repo_variable] = str(current)
+        else:
+            # The code and the data it reads are different repositories, so the
+            # install root says nothing about where the data lives. Pointing
+            # this at ``current`` would aim it at a frozen copy of the data
+            # captured inside the release -- which reads as a working server
+            # serving silently stale content, the worst available failure.
+            resolved_repo = _resolve_external_repo(
+                args.repo_path, existing_environment_value(environment_file, repo_variable)
+            )
+            if resolved_repo is None:
+                raise InstallError(
+                    f"This pack keeps {repo_variable} outside the install root, and no existing "
+                    f"value was found in {environment_file}. Re-run with "
+                    f"--repo-path /path/to/checkout. Refusing to guess: a wrong value here "
+                    f"produces a healthy server serving stale data."
+                )
+            managed_environment[repo_variable] = str(resolved_repo)
         services = manifest["services"]
         if not isinstance(services, list) or not all(isinstance(item, dict) for item in services):
             raise InstallError("pack manifest services must be an array of objects")

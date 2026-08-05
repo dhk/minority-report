@@ -3,7 +3,13 @@ format_version = 1
 name = "alexandria"
 display_name = "Alexandria"
 default_install_root = "~/src/alexandria"
+# ALEXANDRIA_REPO names the research corpus (dhk/alexandria), which since the
+# split is a different repository from this one. It is NOT the install root:
+# pointing it there aims the server at the frozen copy of research/ captured
+# inside the release, which serves silently stale data while reporting healthy.
+# Set it once with --repo-path; the installer preserves it across upgrades.
 repo_environment = "ALEXANDRIA_REPO"
+repo_is_install_root = false
 environment_file = "~/.config/alexandria/alexandria.env"
 environment = { ALEXANDRIA_DATA_DIR = "~/.local/share/alexandria", ALEXANDRIA_SECRETS_FILE = "~/.config/alexandria/secrets.env" }
 secrets_file = "~/.config/alexandria/secrets.env"
@@ -89,7 +95,7 @@ port = 8797
 unit = "alexandria-mcp.service"
 health_url = "http://127.0.0.1:8797/health"
 health_service = "alexandria"
-source = "dhk/alexandria"
+source = "dhk/minority-report"
 adopt_listener = true
 route_mode = "funnel"
 route_host = "tailscale-self"
