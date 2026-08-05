@@ -39,6 +39,7 @@ from alexandria.infrastructure.config import (
     RepoNotFoundError,
     load_config,
 )
+from alexandria.infrastructure.research_repo import list_investigations
 from alexandria.infrastructure.secrets import SecretNotFoundError, openrouter_api_key
 from alexandria.input_resolution import (
     GitHubResolver,
@@ -132,6 +133,26 @@ def _input_rows(inputs: Sequence[InputArtifact]) -> str:
     return "".join(rows)
 
 
+def _investigations(config: Config) -> str:
+    """dhk/alexandria#34's flow view (GET /flow/{slug}) had no path to it from
+    anywhere in this app -- only reachable if you already knew the URL.
+    This is that path: every research/ investigation, linked to its flow.
+    """
+    investigations = list_investigations(config)
+    if not investigations:
+        return "<p>No research investigations yet.</p>"
+    rows = "".join(
+        f'<tr><td><a href="/flow/{_e(inv.slug)}">{_e(inv.title or inv.slug)}</a></td>'
+        f"<td>{_e(inv.assurance_level or 'unset')}</td>"
+        f"<td>{_e(inv.current_stage or 'no lifecycle dirs yet')}</td></tr>"
+        for inv in investigations
+    )
+    return (
+        "<table><thead><tr><th>Investigation</th><th>Assurance</th><th>Stage</th></tr></thead>"
+        f"<tbody>{rows}</tbody></table>"
+    )
+
+
 def _history(store: RunStore) -> str:
     runs = store.list_runs()
     if not runs:
@@ -164,6 +185,7 @@ async def homepage(request: Request) -> HTMLResponse:
 <label>Grading model<input name="grading_model" value="{_e(DEFAULT_GRADING_MODEL)}"></label>
 <label>Hard ceiling (USD)<input name="ceiling_usd" type="number" min="0.01" step="0.01" value="1.00"></label>
 <button type="submit">Review commission →</button></div></div></form></section>
+<h2>Research investigations</h2>{_investigations(config)}
 <h2>Run history</h2>{_history(RunStore(config.data_dir))}
 """
     return HTMLResponse(_layout(body))
@@ -221,10 +243,13 @@ def _review_page(draft: Draft) -> str:
         blocked = False
         label = "Run research"
     else:
-        estimate = f"${draft.estimate_usd:.4f} maximum"
+        # Same correction as the MCP review surface (dhk/alexandria#32): this is
+        # an estimate, not a cap. Runs have come in at ~2x it.
+        estimate = f"${draft.estimate_usd:.4f}"
         blocked = draft.estimate_usd > draft.ceiling_usd
         price_note = (
-            f"Hard ceiling: ${draft.ceiling_usd:.2f}."
+            f"An estimate, not a cap. Hard ceiling ${draft.ceiling_usd:.2f} "
+            "is the only bound enforced."
             if not blocked
             else f"Estimate exceeds the ${draft.ceiling_usd:.2f} ceiling."
         )
@@ -235,7 +260,7 @@ def _review_page(draft: Draft) -> str:
 <div class="grid"><section><h2>What leaves this machine</h2><table><thead><tr><th>Input</th><th>State</th><th>Metadata</th></tr></thead><tbody>{_input_rows(draft.inputs)}</tbody></table>
 <h2>Models</h2><ul>{models}</ul><p>Models research independently and never see each other's output.</p>
 <details><summary>Brief sent verbatim</summary><pre>{_e(draft.brief.verbatim())}</pre></details></section>
-<aside class="card"><div class="mono">Estimated maximum</div><h2>{_e(estimate)}</h2><p>{_e(price_note)}</p>
+<aside class="card"><div class="mono">Estimated cost</div><h2>{_e(estimate)}</h2><p>{_e(price_note)}</p>
 <p>Keys are resolved locally and are not exposed to this interface.</p>
 <form action="/dispatch/{_e(draft.draft_id)}" method="post"><button{disabled}>{_e(label)}</button></form></aside></div>"""
     return _layout(body, title="Review commission · Alexandria")

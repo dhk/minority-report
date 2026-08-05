@@ -222,19 +222,51 @@ def _idea_stage(investigation_dir: Path, topic: dict[str, object]) -> StageRecor
     )
 
 
+_NOT_TASK_SHAPED = "Not structured as Task/Context/Constraints/Output needs — see the full brief."
+
+
+def _freeform_brief_headline(text: str) -> str:
+    """Falls back to the document's own title when it isn't in the commission
+    surface's verbatim Task/Context/Constraints/Output-needs format -- a real
+    investigation's brief (freeform markdown, written by a human or an
+    interactive session rather than Brief.verbatim()) is a second, equally
+    legitimate brief shape this module has to read, not a malformed one.
+    """
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            return stripped.lstrip("#").strip()
+    for line in text.splitlines():
+        if line.strip():
+            return line.strip()
+    return "Brief on file"
+
+
 def _brief_stage(investigation_dir: Path) -> StageRecord:
     brief_path = investigation_dir / "01-brief" / "brief.md"
     if not brief_path.is_file():
         return _empty_stage("brief")
     text = brief_path.read_text(encoding="utf-8")
     sections = _brief_sections(text)
-    lanes = (
-        _lane("Task", sections.get("Task")),
-        _lane("Context", sections.get("Context")),
-        _lane("Constraints", sections.get("Constraints")),
-        _lane("Output needs", sections.get("Output needs")),
-    )
-    headline = _truncate(sections.get("Task") or "Brief on file", limit=112)
+    if sections:
+        lanes = (
+            _lane("Task", sections.get("Task")),
+            _lane("Context", sections.get("Context")),
+            _lane("Constraints", sections.get("Constraints")),
+            _lane("Output needs", sections.get("Output needs")),
+        )
+        headline = _truncate(sections.get("Task") or "Brief on file", limit=112)
+    else:
+        # Present, real, substantial content -- just not in the one format
+        # this module knows how to slot into four lanes. "Not recorded"
+        # would misstate that as absence; say what's actually true instead.
+        lanes = (
+            Lane("Task", _NOT_TASK_SHAPED),
+            Lane("Context", _NOT_TASK_SHAPED),
+            Lane("Constraints", _NOT_TASK_SHAPED),
+            Lane("Output needs", _NOT_TASK_SHAPED),
+        )
+        headline = _truncate(_freeform_brief_headline(text), limit=112)
     excerpt = _excerpt_from_file(brief_path)
     return StageRecord(
         key="brief",
