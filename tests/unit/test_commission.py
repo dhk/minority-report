@@ -7,6 +7,7 @@ import httpx
 import pytest
 
 from alexandria.commission import (
+    ASSUMED_COMPLETION_TOKENS,
     WEB_SEARCH_COST_USD,
     CommissionError,
     CommissionService,
@@ -344,3 +345,102 @@ async def test_failed_call_is_missing_observation_not_silence(tmp_path: Path) ->
     failed = next(row for row in rows if row["model_id"] == "beta/model")
     assert failed["score"] == ""
     assert any("missing observations (✕), not silence" in item for item in run.limitations)
+
+
+@pytest.mark.anyio
+async def test_estimate_components_account_for_the_whole_total(tmp_path: Path) -> None:
+    # The operator approves a number; the components must add up to that number
+    # or the breakdown is decoration.
+    service = CommissionService(_config(tmp_path), FakeGateway())
+    draft = await service.create_draft(
+        Brief(task="Assess the provider port."),
+        [extract_input("brief.md", b"Keep the port narrow.")],
+        ["alpha/model", "beta/model"],
+        "grader/model",
+        1.0,
+    )
+    detail = draft.estimate_detail
+    assert detail is not None
+    assert detail.total_usd == draft.estimate_usd
+    summed = detail.research_usd + detail.grading_usd + detail.web_search_usd
+    assert summed == pytest.approx(detail.total_usd)
+    # Web search is on by default, so it must be visible as its own term.
+    assert detail.web_search_usd == pytest.approx(WEB_SEARCH_COST_USD * 2)
+    assert detail.research_model_count == 2
+
+
+@pytest.mark.anyio
+async def test_web_search_off_removes_the_search_term(tmp_path: Path) -> None:
+    service = CommissionService(_config(tmp_path), FakeGateway())
+    draft = await service.create_draft(
+        Brief(task="Assess the provider port."),
+        [extract_input("brief.md", b"Keep the port narrow.")],
+        ["alpha/model", "beta/model"],
+        "grader/model",
+        1.0,
+        web_search=False,
+    )
+    assert draft.estimate_detail is not None
+    assert draft.estimate_detail.web_search_usd == 0.0
+
+
+@pytest.mark.anyio
+async def test_cost_json_records_prediction_against_measurement(tmp_path: Path) -> None:
+    service = CommissionService(_config(tmp_path), FakeGateway())
+    draft = await service.create_draft(
+        Brief(task="Assess the provider port."),
+        [extract_input("brief.md", b"Keep the port narrow.")],
+        ["alpha/model", "beta/model"],
+        "grader/model",
+        1.0,
+    )
+    run = await service.dispatch(draft.draft_id)
+    cost = json.loads((service.store.run_dir(run.run_id) / "cost.json").read_text(encoding="utf-8"))
+
+    assert cost["estimate"]["total_usd"] == draft.estimate_usd
+    # Two research calls plus grading, each 0.01 in the fake gateway.
+    assert cost["actual"]["total_usd"] == pytest.approx(0.03)
+    assert cost["actual"]["research_usd"] == pytest.approx(0.02)
+    assert cost["actual"]["grading_usd"] == pytest.approx(0.01)
+    assert cost["actual"]["billed_call_count"] == 3
+    assert cost["actual"]["failed_call_count"] == 0
+    # Both halves must be present, or the pair cannot be fitted later.
+    assert cost["estimate"]["assumed_completion_tokens"] == ASSUMED_COMPLETION_TOKENS
+    assert cost["dispatched_models"] == ["alpha/model", "beta/model"]
+
+
+@pytest.mark.anyio
+async def test_a_failed_call_is_still_counted_in_the_cost_record(tmp_path: Path) -> None:
+    # A model that fails after billable output still spent money. Dropping it
+    # from the record is exactly how an overrun stays invisible.
+    service = CommissionService(_config(tmp_path), PartialGateway())
+    draft = await service.create_draft(
+        Brief(task="Assess the provider port."),
+        [extract_input("brief.md", b"Keep the port narrow.")],
+        ["alpha/model", "beta/model"],
+        "grader/model",
+        1.0,
+    )
+    run = await service.dispatch(draft.draft_id)
+    cost = json.loads((service.store.run_dir(run.run_id) / "cost.json").read_text(encoding="utf-8"))
+
+    assert cost["actual"]["failed_call_count"] == 1
+    assert cost["actual"]["unpriced_call_count"] == 1
+    assert cost["actual"]["billed_call_count"] == 2
+
+
+@pytest.mark.anyio
+async def test_cost_json_is_listed_as_a_run_artifact(tmp_path: Path) -> None:
+    service = CommissionService(_config(tmp_path), FakeGateway())
+    draft = await service.create_draft(
+        Brief(task="Assess the provider port."),
+        [extract_input("brief.md", b"Keep the port narrow.")],
+        ["alpha/model", "beta/model"],
+        "grader/model",
+        1.0,
+    )
+    run = await service.dispatch(draft.draft_id)
+    manifest = json.loads(
+        (service.store.run_dir(run.run_id) / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert "cost.json" in manifest["artifacts"]

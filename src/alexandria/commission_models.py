@@ -40,6 +40,41 @@ class Brief(BaseModel):
         )
 
 
+class CostEstimate(BaseModel):
+    """What the estimate is made of, and what it assumed.
+
+    Kept as components rather than one number because a run that comes in
+    over its estimate is otherwise undiagnosable: you can see that the total
+    was wrong but not which term was wrong. Recording the assumptions
+    alongside the prediction is what makes the formula fittable later
+    (dhk/alexandria#32).
+    """
+
+    research_usd: float
+    grading_usd: float
+    web_search_usd: float
+    total_usd: float
+    input_tokens: int
+    grading_input_tokens: int
+    assumed_completion_tokens: int
+    research_model_count: int
+
+
+class CostActual(BaseModel):
+    """What the run really cost, in the same shape as the estimate."""
+
+    research_usd: float | None
+    grading_usd: float | None
+    total_usd: float | None
+    research_prompt_tokens: int | None
+    research_completion_tokens: int | None
+    grading_prompt_tokens: int | None
+    grading_completion_tokens: int | None
+    billed_call_count: int
+    failed_call_count: int
+    unpriced_call_count: int
+
+
 class Draft(BaseModel):
     draft_id: str
     created_at: datetime
@@ -49,6 +84,7 @@ class Draft(BaseModel):
     grading_model: str
     ceiling_usd: float
     estimate_usd: float | None
+    estimate_detail: CostEstimate | None = None
     pricing_error: str | None = None
     web_search: bool = True
 

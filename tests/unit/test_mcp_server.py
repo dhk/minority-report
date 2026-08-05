@@ -1,5 +1,6 @@
 import json
 import re
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Self, cast
 
@@ -7,10 +8,11 @@ import pytest
 
 from alexandria import mcp_server
 from alexandria.commission import RunStore
-from alexandria.commission_models import CallRecord, InputArtifact
+from alexandria.commission_models import Brief, CallRecord, CostEstimate, Draft, InputArtifact
 from alexandria.infrastructure.config import ENV_DATA_DIR, ENV_REPO_ROOT, Config, load_config
 from alexandria.input_resolution import extract_input
 from alexandria.mcp_server import (
+    _draft_review,
     _extra_allowed_hosts,
     _http_token,
     _tailscale_dns_name,
@@ -352,3 +354,56 @@ def test_draft_resolution_accepts_morphed_with_expression(repo: Path) -> None:
     result = draft_resolution(slug="alpha", outcome="morphed", expression="research/successor-idea")
     assert "validates" in result
     assert "expression: research/successor-idea" in result
+
+
+def _priced_draft(estimate_usd: float, ceiling_usd: float = 1.0) -> Draft:
+    return Draft(
+        draft_id="d-test",
+        created_at=datetime(2026, 8, 5, tzinfo=UTC),
+        brief=Brief(task="Assess the provider port."),
+        inputs=[],
+        models=["alpha/model", "beta/model"],
+        grading_model="grader/model",
+        ceiling_usd=ceiling_usd,
+        estimate_usd=estimate_usd,
+        estimate_detail=CostEstimate(
+            research_usd=0.24,
+            grading_usd=0.25,
+            web_search_usd=0.01,
+            total_usd=estimate_usd,
+            input_tokens=1_000,
+            grading_input_tokens=5_000,
+            assumed_completion_tokens=2_000,
+            research_model_count=2,
+        ),
+    )
+
+
+def test_draft_review_does_not_present_the_estimate_as_a_maximum() -> None:
+    # Runs have landed at ~2x this figure. Calling it a maximum made the one
+    # step that spends real money misleading (dhk/alexandria#32).
+    review = _draft_review(_priced_draft(0.50))
+    assert "maximum" not in review
+    assert "Estimate: $0.5000" in review
+
+
+def test_draft_review_shows_what_the_estimate_is_made_of() -> None:
+    review = _draft_review(_priced_draft(0.50))
+    assert "research" in review and "$0.2400" in review
+    assert "grading" in review and "$0.2500" in review
+    assert "web search" in review and "$0.0100" in review
+
+
+def test_draft_review_names_what_the_estimate_does_not_cover() -> None:
+    review = _draft_review(_priced_draft(0.50))
+    assert "2,000 completion tokens" in review
+    assert "retries" in review
+    assert "only bound that is enforced" in review
+
+
+def test_draft_review_survives_a_draft_with_no_breakdown() -> None:
+    # Drafts saved before the breakdown existed must still render.
+    draft = _priced_draft(0.50).model_copy(update={"estimate_detail": None})
+    review = _draft_review(draft)
+    assert "Estimate: $0.5000" in review
+    assert "maximum" not in review
