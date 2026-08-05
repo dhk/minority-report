@@ -1,0 +1,14 @@
+headline: "Custom Apps closes the gap for read-only dashboards, not for governed metrics layers"
+consensus:
+  - "All three responding models agree Custom Apps supports parameterized filtering comparable to Lightdash."
+disagreement:
+  - "Models disagree on whether Custom Apps' access-control model is enterprise-ready today."
+novel:
+  - "One model surfaced an undocumented embedding API not mentioned in the public changelog."
+coverage: "2 of 3 dispatched models returned research; the failed call left the access-control claim thinly covered."
+groups:
+  consensus: 4
+  disagreement: 2
+  novel: 1
+  thin: 1
+  silent: 0

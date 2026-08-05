@@ -1,0 +1,13 @@
+{
+  "models_dispatched": [
+    "anthropic/claude-opus-5",
+    "openai/gpt-5.1"
+  ],
+  "inputs": [
+    "pasted brief context"
+  ],
+  "spend_usd": 0.211,
+  "failures": [],
+  "superseded_count": 0,
+  "manifest_excerpt": "Run dispatched 2026-07-21T09:05:00Z against two models with a $0.50 ceiling. Both models returned research and were graded; no calls failed.\n\nNo further stage has run yet — analysis has not been picked up since dispatch."
+}

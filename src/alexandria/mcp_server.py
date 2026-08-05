@@ -57,6 +57,8 @@ from alexandria.input_resolution import (
     pasted_input,
     validate_input_set,
 )
+from alexandria.resolution import RESOLUTION_FILENAME, ResolutionError
+from alexandria.resolution import draft_resolution as draft_resolution_model
 from alexandria.version import service_version
 
 server = FastMCP("alexandria")
@@ -175,6 +177,56 @@ def search_research(query: str, limit: int = 10) -> str:
         return f"No matches for {query!r} under research/."
     lines = [f"{hit.slug}/{hit.relative_path}:{hit.line_number}: {hit.snippet}" for hit in hits]
     return "\n".join(lines)
+
+
+@server.tool()
+def draft_resolution(
+    slug: str,
+    outcome: str,
+    expression: str = "",
+    decided_by: str = "",
+    decided_at: str = "",
+    rationale: str = "",
+) -> str:
+    """Validate an idea's resolution (issue #35's taxonomy) and return the
+    resolution.yaml text to save, without writing anything.
+
+    `outcome` must be one of 'implemented', 'morphed', or 'nixed' -- there is
+    no fourth "back-burnered" value; an idea with no resolution.yaml is simply
+    unresolved. 'morphed' requires `expression` (a forward pointer to what the
+    idea became) -- morphed without one is itself a dead end and is rejected.
+
+    Like every other write-shaped tool here, this does NOT touch the git
+    working tree. research/ only changes by a deliberate operator commit
+    (DESIGN.md) -- this tool validates and drafts the file; saving it to
+    research/<slug>/resolution.yaml and committing it is the operator's own
+    action.
+    """
+    config = _config_or_message()
+    if isinstance(config, str):
+        return config
+    investigation = find_investigation(config, slug.strip())
+    if investigation is None:
+        return f"No investigation named {slug!r} under research/. See list_research."
+    try:
+        resolution = draft_resolution_model(
+            outcome=outcome,
+            expression=expression,
+            decided_by=decided_by,
+            decided_at=decided_at,
+            rationale=rationale,
+        )
+    except ResolutionError as exc:
+        return f"Resolution not valid: {exc}"
+    save_path = investigation.path / RESOLUTION_FILENAME
+    return "\n".join(
+        [
+            f"Resolution for {investigation.slug} validates.",
+            f"Save this to {save_path} and commit it -- this tool has not written anything:",
+            "",
+            resolution.to_yaml().rstrip(),
+        ]
+    )
 
 
 def _draft_review(draft: Draft) -> str:
