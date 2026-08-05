@@ -107,6 +107,9 @@ class PackSpec:
     capability: CapabilitySpec | None
     tailscale: TailscaleSpec | None
     registry: RegistrySpec | None
+    # False when the repository this tool reads is a different repo from the
+    # one being installed. Default True keeps every existing pack unchanged.
+    repo_is_install_root: bool = True
 
 
 @dataclass(frozen=True)
@@ -331,6 +334,7 @@ def load_spec(path: Path) -> PackSpec:
         display_name=_required_string(pack, "display_name"),
         default_install_root=_required_string(pack, "default_install_root"),
         repo_environment=_required_string(pack, "repo_environment"),
+        repo_is_install_root=bool(pack.get("repo_is_install_root", True)),
         environment_file=_required_string(pack, "environment_file"),
         environment=_string_mapping(pack, "environment"),
         secrets_file=_required_string(pack, "secrets_file"),
@@ -426,6 +430,7 @@ def _manifest(root: Path, spec: PackSpec, bundle_id: str) -> dict[str, Any]:
         "install": {
             "default_root": spec.default_install_root,
             "repo_environment": spec.repo_environment,
+            "repo_is_install_root": spec.repo_is_install_root,
             "environment_file": spec.environment_file,
             "environment": spec.environment,
             "secrets_file": spec.secrets_file,
