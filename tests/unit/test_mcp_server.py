@@ -10,6 +10,7 @@ import pytest
 from alexandria import mcp_server
 from alexandria.commission import RunStore
 from alexandria.commission_models import Brief, CallRecord, CostEstimate, Draft, InputArtifact
+from alexandria.infrastructure import config as config_module
 from alexandria.infrastructure.config import ENV_DATA_DIR, ENV_REPO_ROOT, Config, load_config
 from alexandria.input_resolution import extract_input
 from alexandria.mcp_server import (
@@ -44,12 +45,25 @@ def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return repo_root
 
 
-def test_status_reports_not_found_without_repo(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+@pytest.fixture
+def no_configured_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Construct "no repo configured" for real, not just in os.environ.
+
+    load_config resolves ALEXANDRIA_REPO through the canonical host file
+    as well as the process environment (resolve_host_environment), so
+    delenv alone cannot create this precondition: on a configured host
+    the file still supplies a repo and the test quietly exercises the
+    opposite case. Point the default host file somewhere that does not
+    exist, then unset the variable and stand in a directory with no
+    checkout above it.
+    """
+    monkeypatch.setattr(config_module, "DEFAULT_HOST_ENV_FILE", tmp_path / "absent-host.env")
     monkeypatch.delenv(ENV_REPO_ROOT, raising=False)
     monkeypatch.setenv(ENV_DATA_DIR, str(tmp_path / "state"))
     monkeypatch.chdir(tmp_path)
+
+
+def test_status_reports_not_found_without_repo(no_configured_repo: None) -> None:
     assert "ALEXANDRIA_REPO" in status()
 
 
@@ -234,16 +248,28 @@ def test_port_probe_still_rejects_a_live_listener() -> None:
 
 
 def test_http_mode_exits_cleanly_when_repo_not_found(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    no_configured_repo: None, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """A missing/undetectable repo must be a clean exit(1) with a stderr
     message, never an uncaught RepoNotFoundError traceback — that's the
     difference between a client seeing "server error" on every reconnect
     and seeing why, once (regression test for the bug this was).
+
+    The repo check must also come before the port probe. It used to be
+    reachable here on a configured host, where this test would either
+    fail on the wrong error or bind 8797 — the production port — and
+    start a real server out of the test suite.
     """
-    monkeypatch.delenv(ENV_REPO_ROOT, raising=False)
-    monkeypatch.setenv(ENV_DATA_DIR, str(tmp_path / "state"))
-    monkeypatch.chdir(tmp_path)
+
+    def unreachable(host: str, port: int) -> str | None:
+        raise AssertionError(
+            f"repo resolution must fail before the port probe; probed {host}:{port}"
+        )
+
+    monkeypatch.setattr(mcp_server, "_port_available", unreachable)
+    monkeypatch.setattr(
+        mcp_server.server, "run", lambda *a, **k: pytest.fail("the server must not start")
+    )
     with pytest.raises(SystemExit) as exc_info:
         main(["--http"])
     assert exc_info.value.code == 1
