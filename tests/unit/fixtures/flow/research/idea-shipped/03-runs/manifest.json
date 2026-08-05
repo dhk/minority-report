@@ -1,0 +1,18 @@
+{
+  "models_dispatched": [
+    "anthropic/claude-opus-5",
+    "openai/gpt-5.1",
+    "google/gemini-3-pro"
+  ],
+  "inputs": [
+    "pasted brief context",
+    "supersimple-changelog.pdf",
+    "https://github.com/example/lightdash-comparison-issue"
+  ],
+  "spend_usd": 0.842,
+  "failures": [
+    "google/gemini-3-pro: upstream 503 after 3 retries"
+  ],
+  "superseded_count": 1,
+  "manifest_excerpt": "Run dispatched 2026-06-03T14:22:00Z against three models with a $1.00 ceiling.\n\nOne call failed after exhausting retries; the remaining two models returned research and were graded. This run supersedes an earlier run (run-2026-06-02-a) that was discarded after a brief revision changed the comparison set from four vendors to six."
+}

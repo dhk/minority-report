@@ -1,0 +1,8 @@
+headline: "Recommend Custom Apps for read-only reporting migrations only, revisit post-GA"
+findings:
+  - "Custom Apps is a credible Lightdash replacement for read-only, non-technical reporting."
+evidence_base: "2 independent model runs, 1 changelog PDF, 1 GitHub issue thread."
+not_established:
+  - "Enterprise-grade access control parity with governed BI tools."
+open_questions:
+  - "Does the undocumented embedding API ship stable at GA, or is it beta-only?"

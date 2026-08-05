@@ -31,6 +31,8 @@ from alexandria.commission import (
     RunStore,
 )
 from alexandria.commission_models import Brief, Draft, InputArtifact, RunRecord
+from alexandria.flow import build_flow_document, flow_document_json
+from alexandria.flow_view import render_flow_page
 from alexandria.infrastructure.config import (
     Config,
     HostEnvironmentError,
@@ -767,6 +769,18 @@ async def artifact_bundle(request: Request) -> Response:
     )
 
 
+async def flow(request: Request) -> Response:
+    """RFC-0007: the idea-to-expression flow for one research/ investigation."""
+    config: Config = request.app.state.config
+    slug = request.path_params["slug"]
+    document = build_flow_document(config, slug)
+    if document is None:
+        return HTMLResponse(
+            _layout(f"<h1>No investigation named &ldquo;{_e(slug)}&rdquo;</h1>"), status_code=404
+        )
+    return HTMLResponse(render_flow_page(flow_document_json(document)))
+
+
 def create_app(config: Config | None = None) -> Starlette:
     config = config or load_config()
     routes: list[Any] = [
@@ -777,6 +791,7 @@ def create_app(config: Config | None = None) -> Starlette:
         Route("/runs/{run_id}/report.md", report_markdown),
         Route("/runs/{run_id}/heatmap.html", heatmap_html),
         Route("/runs/{run_id}/bundle.zip", artifact_bundle),
+        Route("/flow/{slug}", flow),
     ]
     matches = list((config.repo_root / "docs/ux/prototype/_ds").glob("dhk-design-system-*"))
     if matches:

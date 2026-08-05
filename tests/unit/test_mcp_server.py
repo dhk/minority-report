@@ -19,6 +19,7 @@ from alexandria.mcp_server import (
     begin_research,
     build_transport_security,
     connector_urls,
+    draft_resolution,
     list_research,
     main,
     render_urls,
@@ -316,3 +317,38 @@ async def test_begin_research_resolves_supported_url(
 async def test_begin_research_requires_paste_or_url(repo: Path) -> None:
     result = await begin_research(task="Research this.")
     assert "Provide pasted content" in result
+
+
+def _make_investigation(repo: Path, slug: str = "alpha") -> Path:
+    investigation = repo / "research" / slug
+    investigation.mkdir(parents=True)
+    (investigation / "topic.yaml").write_text(f"title: {slug.title()}\n", encoding="utf-8")
+    return investigation
+
+
+def test_draft_resolution_reports_unknown_slug(repo: Path) -> None:
+    result = draft_resolution(slug="nope", outcome="implemented")
+    assert "No investigation" in result
+
+
+def test_draft_resolution_validates_and_does_not_write(repo: Path) -> None:
+    investigation = _make_investigation(repo)
+    result = draft_resolution(slug="alpha", outcome="implemented")
+    assert "validates" in result
+    assert "outcome: implemented" in result
+    # Same discipline as run_research: this tool drafts, it never writes.
+    assert not (investigation / "resolution.yaml").exists()
+
+
+def test_draft_resolution_rejects_morphed_without_expression(repo: Path) -> None:
+    _make_investigation(repo)
+    result = draft_resolution(slug="alpha", outcome="morphed")
+    assert "not valid" in result
+    assert "expression" in result
+
+
+def test_draft_resolution_accepts_morphed_with_expression(repo: Path) -> None:
+    _make_investigation(repo)
+    result = draft_resolution(slug="alpha", outcome="morphed", expression="research/successor-idea")
+    assert "validates" in result
+    assert "expression: research/successor-idea" in result

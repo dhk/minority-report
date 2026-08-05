@@ -1,0 +1,9 @@
+title: "Should we adopt a shared prompt-eval harness across repos?"
+status: "single-source-draft"
+assurance_level: "bronze"
+slug: idea-stalled
+opened: 2026-07-20
+origin: "Noticed three repos independently building ad hoc eval scripts."
+claim_under_test: "A shared harness would reduce duplicated eval infrastructure without forcing a single opinionated framework."
+why_now: "wingman and praxis both added eval scaffolding within the same week."
+scope: "Survey existing ad hoc harnesses only; no build decision in this pass."

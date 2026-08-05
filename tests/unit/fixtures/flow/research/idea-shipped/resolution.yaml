@@ -1,0 +1,8 @@
+outcome: implemented
+expression: "08-published/recommendation.md"
+decided_by: "operator (davehk@gmail.com)"
+decided_at: "2026-06-18"
+rationale: >
+  Shared the read-only-migration recommendation with both clients that
+  prompted the investigation. Declined to expand scope to the governed-BI
+  comparison until Supersimple reaches GA, per the synthesis's open question.
