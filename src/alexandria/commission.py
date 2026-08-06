@@ -30,6 +30,7 @@ from alexandria.commission_models import (
     Instrument,
     RunRecord,
     ScoreRecord,
+    SourceCitation,
     Stance,
     Strength,
 )
@@ -326,6 +327,8 @@ class OpenRouterGateway:
             first = choices[0] if isinstance(choices, list) and choices else {}
             message = first.get("message") if isinstance(first, dict) else {}
             body = message.get("content") if isinstance(message, dict) else None
+            annotations = message.get("annotations") if isinstance(message, dict) else []
+            citations = _source_citations(annotations)
             usage = payload.get("usage") if isinstance(payload, dict) else {}
             usage = usage if isinstance(usage, dict) else {}
             resolved_generation_id = generation_id or str(payload.get("id") or "") or None
@@ -364,6 +367,7 @@ class OpenRouterGateway:
                 cost=cost,
                 latency_ms=latency_ms,
                 truncated=finish_reason == "length",
+                citations=citations,
             )
         except (ValueError, TypeError, KeyError) as exc:
             return CallRecord(
@@ -419,11 +423,39 @@ def _optional_float(value: object) -> float | None:
     return float(value) if isinstance(value, int | float) else None
 
 
-def _research_prompt(brief: Brief, inputs: list[InputArtifact]) -> str:
+def _source_citations(value: object) -> list[SourceCitation]:
+    if not isinstance(value, list):
+        return []
+    citations: list[SourceCitation] = []
+    for annotation in value:
+        if not isinstance(annotation, dict) or annotation.get("type") != "url_citation":
+            continue
+        citation = annotation.get("url_citation")
+        if not isinstance(citation, dict) or not str(citation.get("url") or "").strip():
+            continue
+        citations.append(
+            SourceCitation(
+                url=str(citation["url"]).strip(),
+                title=str(citation.get("title") or "").strip() or None,
+                content=str(citation.get("content") or "").strip() or None,
+            )
+        )
+    return citations
+
+
+def _research_prompt(brief: Brief, inputs: list[InputArtifact], *, web_search: bool = False) -> str:
+    research_instruction = (
+        "Use the supplied materials as context and proactively search for current prior art. "
+        "Prefer primary sources such as official product documentation, repositories, standards, "
+        "and research papers. Cite every external capability claim with a direct link. Record "
+        "search gaps and do not infer a product capability from marketing language alone."
+        if web_search
+        else "Answer the brief using only the supplied materials and clearly identify uncertainty."
+    )
     sections = [
         (
             "You are one independent research model in a multi-model commission. "
-            "Answer the brief using only the supplied materials and clearly identify uncertainty."
+            + research_instruction
         ),
         "BRIEF — SENT VERBATIM\n" + brief.verbatim(),
     ]
@@ -894,7 +926,7 @@ class CommissionService:
         )
         run_id = run.run_id
 
-        prompt = _research_prompt(draft.brief, draft.inputs)
+        prompt = _research_prompt(draft.brief, draft.inputs, web_search=draft.web_search)
         calls = await asyncio.gather(
             *(
                 self.gateway.complete(model, prompt, web_search=draft.web_search)
@@ -925,6 +957,23 @@ class CommissionService:
                 f"Research calls searched the live web on {started.date().isoformat()}; "
                 "re-running this brief will read whatever the sources say then, not now."
             )
+        sources_by_url: dict[str, dict[str, object]] = {}
+        for call in calls:
+            for citation in call.citations:
+                source = sources_by_url.setdefault(
+                    citation.url,
+                    {
+                        "url": citation.url,
+                        "title": citation.title,
+                        "content": citation.content,
+                        "observed_by": [],
+                    },
+                )
+                observed_by = source["observed_by"]
+                if isinstance(observed_by, list) and call.model_id not in observed_by:
+                    observed_by.append(call.model_id)
+        if draft.web_search and not sources_by_url:
+            limitations.append("Web search returned no preserved URL citations.")
         claims: list[ClaimRecord] = []
         scores: list[ScoreRecord] = []
         grading_calls: list[CallRecord] = []
@@ -1034,6 +1083,7 @@ class CommissionService:
             writer.writerow(score.model_dump())
         _write_atomic(run_dir / "scores.csv", csv_buffer.getvalue().encode())
         _write_atomic(run_dir / "report.md", (report.rstrip() + "\n").encode())
+        _write_atomic(run_dir / "sources.json", _json_bytes(list(sources_by_url.values())))
 
         completed = datetime.now(UTC)
         actual = _cost_actual(calls, grading_calls)
@@ -1099,6 +1149,7 @@ class CommissionService:
                 "claims.json",
                 "scores.csv",
                 "report.md",
+                "sources.json",
                 "cost.json",
                 "manifest.json",
                 "raw/",

@@ -21,7 +21,7 @@ from alexandria.commission import (
     classify_scores,
     score_from_stance,
 )
-from alexandria.commission_models import Brief, CallRecord
+from alexandria.commission_models import Brief, CallRecord, SourceCitation
 from alexandria.infrastructure.config import Config
 from alexandria.input_resolution import extract_input
 
@@ -99,6 +99,17 @@ class FakeGateway:
             generation_id=f"gen-{model.replace('/', '-')}-{self.calls_made}",
             cost=0.01,
             latency_ms=10,
+            citations=(
+                [
+                    SourceCitation(
+                        url="https://example.com/primary-source",
+                        title="Primary source",
+                        content="Capability evidence.",
+                    )
+                ]
+                if web_search and model != "grader/model"
+                else []
+            ),
         )
 
 
@@ -322,6 +333,44 @@ async def test_a_truncated_answer_says_so_in_the_run_limitations(tmp_path: Path)
 
 
 @pytest.mark.anyio
+async def test_web_search_preserves_openrouter_url_citations() -> None:
+    body = json.dumps(
+        {
+            "id": "gen-1",
+            "model": "alpha/model",
+            "choices": [
+                {
+                    "message": {
+                        "content": "A sourced answer.",
+                        "annotations": [
+                            {
+                                "type": "url_citation",
+                                "url_citation": {
+                                    "url": "https://example.com/docs",
+                                    "title": "Product docs",
+                                    "content": "Capability evidence.",
+                                },
+                            }
+                        ],
+                    }
+                }
+            ],
+            "usage": {"cost": 0.01},
+        }
+    )
+    async with _gateway_returning(body) as gateway:
+        call = await gateway.complete("alpha/model", "prompt", web_search=True)
+
+    assert call.citations == [
+        SourceCitation(
+            url="https://example.com/docs",
+            title="Product docs",
+            content="Capability evidence.",
+        )
+    ]
+
+
+@pytest.mark.anyio
 async def test_without_web_search_no_plugin_field_is_sent() -> None:
     sent: list[dict[str, Any]] = []
     async with _gateway_capturing(sent) as gateway:
@@ -459,6 +508,11 @@ async def test_commission_persists_accepted_run_shapes(tmp_path: Path) -> None:
         ["alpha/model", "beta/model"],
         "grader/model",
         1.0,
+        web_search=True,
+        # Search became opt-in with a mandatory rationale in #56. This run asks
+        # for it because the citation shapes below are the thing under test:
+        # with search off there are no citations to preserve or deduplicate.
+        web_search_rationale="The preserved citation shapes are what this test asserts.",
     )
     run = await service.dispatch(draft.draft_id)
     run_dir = service.store.run_dir(run.run_id)
@@ -469,12 +523,21 @@ async def test_commission_persists_accepted_run_shapes(tmp_path: Path) -> None:
     assert service.store.load_run(run.run_id).run_id == run.run_id
     assert (run_dir / "run.json").is_file()
     assert (run_dir / "claims.json").is_file()
+    assert (run_dir / "sources.json").is_file()
     assert (run_dir / "manifest.json").is_file()
     assert (run_dir / "raw/alpha-model.json").is_file()
     run_input = json.loads((run_dir / "run.json").read_text())["inputs"][0]
     assert "text" not in run_input
     assert "original_base64" not in run_input
     assert next((run_dir / "inputs/original").iterdir()).read_bytes() == b"Keep the port narrow."
+    assert json.loads((run_dir / "sources.json").read_text()) == [
+        {
+            "url": "https://example.com/primary-source",
+            "title": "Primary source",
+            "content": "Capability evidence.",
+            "observed_by": ["alpha/model", "beta/model"],
+        }
+    ]
 
     with (run_dir / "scores.csv").open(newline="", encoding="utf-8") as stream:
         rows = list(csv.DictReader(stream))
