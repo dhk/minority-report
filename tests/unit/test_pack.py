@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import shutil
@@ -37,7 +38,9 @@ from deploy.install import (
     install_root_needs_adoption,
     install_support,
     mark_install_root,
+    prompt_install_root,
     render_service_unit,
+    resolve_install_root,
 )
 from scripts.pack import (
     PackError,
@@ -542,6 +545,132 @@ def test_existing_install_root_must_be_adopted_and_is_never_cleared(tmp_path: Pa
 
     assert install_root_needs_adoption(root, "sample-tool") is False
     assert existing.read_text(encoding="utf-8") == "keep me\n"
+
+
+# A password-shaped answer: no separator, so the old code silently resolved it
+# against the working directory and made it a real install root.
+_SECRET_SHAPED = "hunter2Passw0rd"
+
+
+def test_install_root_refuses_a_relative_answer_instead_of_resolving_it_against_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    workdir = tmp_path / "some-unrelated-repo"
+    workdir.mkdir()
+    monkeypatch.chdir(workdir)
+
+    with pytest.raises(InstallError) as excinfo:
+        resolve_install_root(_SECRET_SHAPED, bundle_root=bundle)
+
+    assert "absolute" in str(excinfo.value)
+    assert not (workdir / _SECRET_SHAPED).exists()
+    assert list(workdir.iterdir()) == []
+
+
+def test_install_root_rejection_never_echoes_the_rejected_answer(tmp_path: Path) -> None:
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+
+    with pytest.raises(InstallError) as excinfo:
+        resolve_install_root(_SECRET_SHAPED, bundle_root=bundle)
+
+    assert _SECRET_SHAPED not in str(excinfo.value)
+
+
+def test_install_root_refuses_a_path_inside_the_bundle(tmp_path: Path) -> None:
+    bundle = tmp_path / "bundle"
+    (bundle / "releases").mkdir(parents=True)
+
+    with pytest.raises(InstallError, match="inside the bundle"):
+        resolve_install_root(str(bundle / "releases" / "oops"), bundle_root=bundle)
+
+    with pytest.raises(InstallError, match="inside the bundle"):
+        resolve_install_root(str(bundle), bundle_root=bundle)
+
+
+def test_install_root_refuses_a_missing_parent(tmp_path: Path) -> None:
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+
+    with pytest.raises(InstallError, match="parent directory does not exist"):
+        resolve_install_root(str(tmp_path / "absent" / "root"), bundle_root=bundle)
+
+
+def test_install_root_accepts_an_absolute_path_and_expands_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+    assert (
+        resolve_install_root(str(tmp_path / "root"), bundle_root=bundle)
+        == (tmp_path / "root").resolve()
+    )
+    assert resolve_install_root("~/tools", bundle_root=bundle) == (home / "tools").resolve()
+
+
+def test_prompt_reprompts_after_a_rejected_answer_and_creates_nothing_meanwhile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    workdir = tmp_path / "repo"
+    workdir.mkdir()
+    monkeypatch.chdir(workdir)
+    good = tmp_path / "installed"
+    good.mkdir()
+    answers = iter([_SECRET_SHAPED, str(good)])
+    stream = io.StringIO()
+
+    chosen = prompt_install_root(
+        tmp_path / "default",
+        bundle_root=bundle,
+        input_fn=lambda _prompt: next(answers),
+        stream=stream,
+    )
+
+    assert chosen == good.resolve()
+    assert not (workdir / _SECRET_SHAPED).exists()
+    assert "rejected" in stream.getvalue()
+    assert _SECRET_SHAPED not in stream.getvalue()
+
+
+def test_prompt_requires_confirmation_before_creating_a_new_root(tmp_path: Path) -> None:
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    fresh = tmp_path / "brand-new"
+    existing = tmp_path / "already-there"
+    existing.mkdir()
+    answers = iter([str(fresh), "n", str(existing)])
+
+    chosen = prompt_install_root(
+        tmp_path / "default",
+        bundle_root=bundle,
+        input_fn=lambda _prompt: next(answers),
+        stream=io.StringIO(),
+    )
+
+    assert chosen == existing.resolve()
+    assert not fresh.exists()
+
+
+def test_prompt_gives_up_rather_than_installing_somewhere_unvalidated(tmp_path: Path) -> None:
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    answers = iter([_SECRET_SHAPED, "also-not-a-path", "still/not/absolute"])
+
+    with pytest.raises(InstallError, match="no usable install root after 3 attempts"):
+        prompt_install_root(
+            tmp_path / "default",
+            bundle_root=bundle,
+            input_fn=lambda _prompt: next(answers),
+            stream=io.StringIO(),
+        )
 
 
 def test_installed_support_preserves_docs_without_a_second_source_copy(tmp_path: Path) -> None:
