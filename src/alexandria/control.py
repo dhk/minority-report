@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Protocol, TextIO
 
 from alexandria.infrastructure.config import ENV_REPO_ROOT, RepoNotFoundError, load_config
+from alexandria.infrastructure.research_repo import list_investigations
 from alexandria.version import service_version
 
 DEFAULT_HOST = "127.0.0.1"
@@ -274,8 +275,55 @@ def cycle(repo: Path, host: str, port: int, *, stream: TextIO = sys.stdout) -> b
     return healthy
 
 
-def _print_status(host: str, port: int, *, stream: TextIO = sys.stdout) -> None:
+def _corpus_lines(
+    env: dict[str, str] | os._Environ[str] | None = None,
+    *,
+    host_env_file: Path | None = None,
+    cwd: Path | None = None,
+) -> list[str]:
+    """Describe the corpus this CLI resolves, without ever raising.
+
+    ``status`` is the command reached for when something looks wrong, so a
+    corpus that cannot be resolved or read is reported on the line rather than
+    ending the run.
+
+    This reports the CLI's own resolution, which is not necessarily the corpus
+    the running service opened — see #4 for the same re-derivation making
+    ``url`` wrong. The service is the authority; this is a diagnostic.
+    """
+    try:
+        config = load_config(env, cwd=cwd, host_env_file=host_env_file)
+    except RepoNotFoundError:
+        return [f"Repo: not configured (set {ENV_REPO_ROOT})"]
+    except OSError as exc:
+        return [f"Repo: unreadable ({exc})"]
+    repo = config.repo_root
+    if not repo.is_dir():
+        # Distinguished from an empty corpus deliberately: a pointer at a path
+        # that is not there is the failure this line exists to catch, and
+        # "0" would read as a corpus that merely has nothing in it.
+        return [f"Repo: {repo} — does not exist", "Investigations: unknown"]
+    if not config.research_dir.is_dir():
+        return [f"Repo: {repo}", "Investigations: 0 (no research/ directory yet)"]
+    try:
+        count = len(list_investigations(config))
+    except OSError as exc:
+        return [f"Repo: {repo}", f"Investigations: unreadable ({exc})"]
+    return [f"Repo: {repo}", f"Investigations: {count}"]
+
+
+def _print_status(
+    host: str,
+    port: int,
+    *,
+    stream: TextIO = sys.stdout,
+    env: dict[str, str] | os._Environ[str] | None = None,
+    host_env_file: Path | None = None,
+    cwd: Path | None = None,
+) -> None:
     print(f"Alexandria {service_version()}", file=stream)
+    for line in _corpus_lines(env, host_env_file=host_env_file, cwd=cwd):
+        print(line, file=stream)
     processes = mcp_processes()
     if not processes:
         print("Processes: none", file=stream)

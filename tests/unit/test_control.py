@@ -10,6 +10,114 @@ from alexandria.control import ProcessInfo
 from alexandria.infrastructure import config as config_module
 
 
+def _corpus(tmp_path: Path, *slugs: str) -> Path:
+    repo = tmp_path / "corpus"
+    for slug in slugs:
+        (repo / "research" / slug).mkdir(parents=True)
+    (repo / "research").mkdir(parents=True, exist_ok=True)
+    return repo
+
+
+def _quiet_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep _print_status off this host's real processes and network."""
+    monkeypatch.setattr(control, "mcp_processes", list)
+    monkeypatch.setattr(control, "_health", lambda _host, _port: (False, "not running"))
+
+
+def test_status_reports_the_corpus_it_resolved_and_its_investigation_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _quiet_status(monkeypatch)
+    repo = _corpus(tmp_path, "2026-07-29-one", "2026-08-01-two")
+    stream = io.StringIO()
+
+    control._print_status(
+        "127.0.0.1",
+        8797,
+        stream=stream,
+        env={"ALEXANDRIA_REPO": str(repo)},
+        host_env_file=tmp_path / "missing.env",
+        cwd=tmp_path,
+    )
+
+    output = stream.getvalue()
+    assert f"Repo: {repo}" in output
+    assert "Investigations: 2" in output
+
+
+def test_status_reports_an_empty_corpus_as_zero_not_as_an_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _quiet_status(monkeypatch)
+    repo = _corpus(tmp_path)
+    stream = io.StringIO()
+
+    control._print_status(
+        "127.0.0.1",
+        8797,
+        stream=stream,
+        env={"ALEXANDRIA_REPO": str(repo)},
+        host_env_file=tmp_path / "missing.env",
+        cwd=tmp_path,
+    )
+
+    assert "Investigations: 0" in stream.getvalue()
+
+
+def test_status_says_the_corpus_is_unconfigured_and_still_reports_the_rest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _quiet_status(monkeypatch)
+    monkeypatch.delenv("ALEXANDRIA_REPO", raising=False)
+    stream = io.StringIO()
+
+    control._print_status(
+        "127.0.0.1",
+        8797,
+        stream=stream,
+        env={},
+        host_env_file=tmp_path / "missing.env",
+        cwd=tmp_path / "nowhere",
+    )
+
+    output = stream.getvalue()
+    assert "Repo: not configured (set ALEXANDRIA_REPO)" in output
+    # status is the command reached for when something is wrong: it must still
+    # report process and health rather than stopping at the missing corpus.
+    assert "Health:" in output
+
+
+def test_a_corpus_pointer_at_a_missing_path_is_not_reported_as_an_empty_corpus(
+    tmp_path: Path,
+) -> None:
+    absent = tmp_path / "absent"
+
+    lines = control._corpus_lines(
+        {"ALEXANDRIA_REPO": str(absent)},
+        host_env_file=tmp_path / "missing.env",
+        cwd=tmp_path,
+    )
+
+    assert lines[0] == f"Repo: {absent} — does not exist"
+    assert lines[1] == "Investigations: unknown"
+    assert "Investigations: 0" not in lines
+
+
+def test_a_corpus_without_a_research_directory_says_so_rather_than_just_zero(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "fresh"
+    repo.mkdir()
+
+    lines = control._corpus_lines(
+        {"ALEXANDRIA_REPO": str(repo)},
+        host_env_file=tmp_path / "missing.env",
+        cwd=tmp_path,
+    )
+
+    assert lines == [f"Repo: {repo}", "Investigations: 0 (no research/ directory yet)"]
+
+
 def test_default_repo_prefers_environment(tmp_path: Path) -> None:
     assert (
         control._default_repo(
