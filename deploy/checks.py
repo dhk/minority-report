@@ -18,6 +18,20 @@ from typing import Any, Literal
 CheckState = Literal["pass", "fail", "skip"]
 
 
+def route_paths(route: Mapping[str, Any]) -> list[str]:
+    """Every path a route fronts, newest manifest shape or the older one.
+
+    Routes carry a ``paths`` list so one endpoint can front several paths.
+    Manifests built before that carry a single ``path``; bundles outlive the
+    builder that made them, so both are read.
+    """
+    declared = route.get("paths")
+    if isinstance(declared, list):
+        return [str(item) for item in declared]
+    single = route.get("path")
+    return [str(single)] if single is not None else []
+
+
 @dataclass(frozen=True)
 class CheckResult:
     key: str
@@ -213,8 +227,22 @@ def service_registry_state(config: Mapping[str, Any]) -> tuple[bool, str]:
         ):
             return False, f"{service_id} endpoint differs from the pack declaration"
         expected_route = expected.get("route")
-        if expected_route is not None and actual.get("route") != expected_route:
-            return False, f"{service_id} external route differs from the pack declaration"
+        if expected_route is not None:
+            declared = route_paths(expected_route)
+            reserved = actual.get("routes")
+            actual_routes = (
+                [item for item in reserved if isinstance(item, dict)]
+                if isinstance(reserved, list)
+                else ([actual["route"]] if isinstance(actual.get("route"), dict) else [])
+            )
+            if [str(item.get("path")) for item in actual_routes] != declared:
+                return False, f"{service_id} external route differs from the pack declaration"
+            for item in actual_routes:
+                if any(
+                    item.get(key) != expected_route.get(key)
+                    for key in ("mode", "host", "https_port", "target")
+                ):
+                    return False, f"{service_id} external route differs from the pack declaration"
     return True, f"{data_path} · {len(entries)} declared services reserved"
 
 

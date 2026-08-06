@@ -61,7 +61,7 @@ class RegistryRouteSpec:
     mode: str
     host: str
     https_port: int
-    path: str
+    paths: list[str]
     target: str
 
 
@@ -254,18 +254,25 @@ def load_spec(path: Path) -> PackSpec:
             health_service = _optional_string(raw_entry, "health_service")
             if bool(health_url) != bool(health_service):
                 raise PackError("registry health_url and health_service must be supplied together")
+            # A service may front more than one path on a single endpoint —
+            # Wingman serves both '/' and '/shared' from one port — so paths
+            # are a list. 'route_path' stays accepted for a single path.
             route_keys = {
                 "route_mode",
                 "route_host",
                 "route_https_port",
-                "route_path",
                 "route_target",
             }
-            present_route_keys = route_keys.intersection(raw_entry)
+            path_keys = {"route_path", "route_paths"}
+            present_route_keys = (route_keys | path_keys).intersection(raw_entry)
             route = None
             if present_route_keys:
-                if present_route_keys != route_keys:
-                    missing = ", ".join(sorted(route_keys - present_route_keys))
+                present_paths = path_keys.intersection(raw_entry)
+                if len(present_paths) != 1:
+                    raise PackError("registry route needs exactly one of route_path or route_paths")
+                missing_keys = route_keys - present_route_keys
+                if missing_keys:
+                    missing = ", ".join(sorted(missing_keys))
                     raise PackError(f"registry route is incomplete; missing {missing}")
                 route_mode = _required_string(raw_entry, "route_mode")
                 if route_mode not in {"serve", "funnel"}:
@@ -277,14 +284,29 @@ def load_spec(path: Path) -> PackSpec:
                     or not 1 <= route_port <= 65535
                 ):
                     raise PackError("registry route_https_port must be within 1-65535")
-                route_path = _required_string(raw_entry, "route_path")
-                if not route_path.startswith("/"):
-                    raise PackError("registry route_path must start with '/'")
+                if "route_paths" in raw_entry:
+                    declared = raw_entry["route_paths"]
+                    if (
+                        not isinstance(declared, list)
+                        or not declared
+                        or not all(isinstance(item, str) for item in declared)
+                    ):
+                        raise PackError("registry route_paths must be a non-empty array of strings")
+                else:
+                    declared = [_required_string(raw_entry, "route_path")]
+                route_paths: list[str] = []
+                for raw_path in declared:
+                    if not raw_path.startswith("/"):
+                        raise PackError("every registry route path must start with '/'")
+                    normalized = raw_path.rstrip("/") or "/"
+                    if normalized in route_paths:
+                        raise PackError(f"registry route path is declared twice: {normalized}")
+                    route_paths.append(normalized)
                 route = RegistryRouteSpec(
                     mode=route_mode,
                     host=_required_string(raw_entry, "route_host"),
                     https_port=route_port,
-                    path=route_path.rstrip("/") or "/",
+                    paths=route_paths,
                     target=_required_string(raw_entry, "route_target"),
                 )
             adopt_listener = raw_entry.get("adopt_listener", False)

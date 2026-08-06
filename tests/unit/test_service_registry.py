@@ -4,6 +4,7 @@ import json
 import socket
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -42,6 +43,85 @@ def _store(tmp_path: Path) -> RegistryStore:
         static_range=(18700, 18799),
         dynamic_range=(18800, 18819),
     )
+
+
+def _reserve_wingman(store: RegistryStore, *paths: str) -> dict[str, Any]:
+    reserve_service(
+        store,
+        service_id="wingman",
+        display_name="Wingman",
+        owner="dhk",
+        address="127.0.0.1",
+        port=18789,
+    )
+    return reserve_route(
+        store,
+        service_id="wingman",
+        host="tailscale-self",
+        https_port=443,
+        paths=list(paths),
+        mode="funnel",
+        target="http://127.0.0.1:18789",
+    )
+
+
+def test_one_endpoint_can_front_several_paths(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+
+    entry = _reserve_wingman(store, "/", "/shared")
+
+    assert [route["path"] for route in entry["routes"]] == ["/", "/shared"]
+    # The single-route key is kept in step for readers that predate the list.
+    assert entry["route"] == entry["routes"][0]
+
+
+def test_every_path_of_a_multi_path_entry_is_defended_from_collision(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    _reserve_wingman(store, "/", "/shared")
+    reserve_service(
+        store,
+        service_id="alexandria",
+        display_name="Alexandria",
+        owner="dhk",
+        address="127.0.0.1",
+        port=18797,
+    )
+
+    # '/shared' is the second of wingman's paths: the one a single-route
+    # conflict check would not have seen.
+    with pytest.raises(RegistryError, match="reserved by wingman"):
+        reserve_route(
+            store,
+            service_id="alexandria",
+            host="tailscale-self",
+            https_port=443,
+            paths=["/shared"],
+            mode="funnel",
+            target="http://127.0.0.1:18797",
+        )
+
+
+def test_re_reserving_the_endpoint_keeps_every_route(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    _reserve_wingman(store, "/", "/shared")
+
+    entry = reserve_service(
+        store,
+        service_id="wingman",
+        display_name="Wingman",
+        owner="dhk",
+        address="127.0.0.1",
+        port=18789,
+    )
+
+    assert [route["path"] for route in entry["routes"]] == ["/", "/shared"]
+
+
+def test_a_route_declaring_the_same_path_twice_is_refused(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+
+    with pytest.raises(RegistryError, match="declared twice"):
+        _reserve_wingman(store, "/shared", "/shared/")
 
 
 def test_static_reservation_is_durable_and_idempotent(tmp_path: Path) -> None:
@@ -172,7 +252,7 @@ def test_route_reservations_have_an_independent_collision_namespace(tmp_path: Pa
         service_id="wingman",
         host="tailscale-self",
         https_port=443,
-        path="/",
+        paths=["/"],
         mode="funnel",
         target="http://127.0.0.1:18787",
     )
@@ -181,7 +261,7 @@ def test_route_reservations_have_an_independent_collision_namespace(tmp_path: Pa
         service_id="alexandria",
         host="tailscale-self",
         https_port=443,
-        path="/alexandria/",
+        paths=["/alexandria/"],
         mode="funnel",
         target="http://127.0.0.1:18797",
     )
@@ -195,7 +275,7 @@ def test_route_reservations_have_an_independent_collision_namespace(tmp_path: Pa
             service_id="wingman",
             host="tailscale-self",
             https_port=443,
-            path="/alexandria",
+            paths=["/alexandria"],
             mode="funnel",
             target="http://127.0.0.1:18787",
         )

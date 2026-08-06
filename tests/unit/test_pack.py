@@ -150,14 +150,16 @@ def test_alexandria_pack_config_is_valid() -> None:
     assert spec.registry.helper_path == "/usr/local/bin/service-registry"
     assert spec.registry.static_range == [8700, 8799]
     assert spec.registry.dynamic_range == [8800, 8999]
-    assert [entry.service_id for entry in spec.registry.entries] == [
-        "wingman",
-        "wingman-trent",
-        "alexandria",
-    ]
-    assert spec.registry.entries[1].owner == "trent"
-    assert spec.registry.entries[2].route is not None
-    assert spec.registry.entries[2].route.path == "/alexandria"
+    assert [entry.service_id for entry in spec.registry.entries] == ["wingman", "alexandria"]
+    # Wingman is one multi-user service on 8789 fronting two paths. The
+    # per-user 8787/8788 split, and '/trent' with it, no longer exists (#21).
+    wingman = spec.registry.entries[0]
+    assert wingman.port == 8789
+    assert wingman.route is not None
+    assert wingman.route.paths == ["/", "/shared"]
+    assert wingman.route.target == "http://127.0.0.1:8789"
+    assert spec.registry.entries[1].route is not None
+    assert spec.registry.entries[1].route.paths == ["/alexandria"]
 
 
 def test_health_checks_reject_another_service_on_the_expected_port(
@@ -355,6 +357,176 @@ def test_registry_commands_reserve_endpoint_before_external_route() -> None:
     assert "reserve" in commands[0]
     assert "reserve-route" in commands[1]
     assert commands[1][-1] == "http://127.0.0.1:8797"
+
+
+_PACK_TEMPLATE = """
+[pack]
+format_version = 1
+name = "sample-tool"
+display_name = "Sample Tool"
+default_install_root = "~/src/sample-tool"
+repo_environment = "SAMPLE_REPO"
+environment_file = "~/.config/sample-tool/sample-tool.env"
+environment = {{}}
+secrets_file = "~/.config/sample-tool/secrets.env"
+required_secrets = []
+exclude = []
+
+[[services]]
+unit = "sample-tool.service"
+description = "Sample Tool"
+entrypoint = "sample-tool"
+args = ["serve"]
+health_url = "http://127.0.0.1:9000/health"
+health_service = "sample-tool"
+
+[registry]
+helper_path = "/usr/local/bin/service-registry"
+data_path = "/var/lib/common-services/registry.json"
+static_range = [8700, 8799]
+dynamic_range = [8800, 8999]
+
+[[registry.entries]]
+service_id = "sample-tool"
+display_name = "Sample Tool"
+owner = "dhk"
+protocol = "tcp"
+address = "127.0.0.1"
+port = 8789
+route_mode = "funnel"
+route_host = "tailscale-self"
+route_https_port = 443
+route_target = "http://127.0.0.1:8789"
+{paths}
+"""
+
+
+def _pack_with_paths(tmp_path: Path, paths: str) -> Path:
+    path = tmp_path / "pack.toml"
+    path.write_text(_PACK_TEMPLATE.format(paths=paths), encoding="utf-8")
+    return path
+
+
+def test_one_endpoint_may_declare_several_route_paths(tmp_path: Path) -> None:
+    spec = load_spec(_pack_with_paths(tmp_path, 'route_paths = ["/", "/shared/"]'))
+
+    assert spec.registry is not None
+    route = spec.registry.entries[0].route
+    assert route is not None
+    assert route.paths == ["/", "/shared"]
+
+
+def test_a_single_route_path_is_still_accepted(tmp_path: Path) -> None:
+    spec = load_spec(_pack_with_paths(tmp_path, 'route_path = "/only"'))
+
+    assert spec.registry is not None
+    route = spec.registry.entries[0].route
+    assert route is not None
+    assert route.paths == ["/only"]
+
+
+def test_a_route_declaring_both_path_forms_is_refused(tmp_path: Path) -> None:
+    pack = _pack_with_paths(tmp_path, 'route_path = "/"\nroute_paths = ["/shared"]')
+
+    with pytest.raises(PackError, match="exactly one of route_path or route_paths"):
+        load_spec(pack)
+
+
+def test_a_duplicate_route_path_is_refused(tmp_path: Path) -> None:
+    pack = _pack_with_paths(tmp_path, 'route_paths = ["/shared", "/shared/"]')
+
+    with pytest.raises(PackError, match="declared twice"):
+        load_spec(pack)
+
+
+def test_registry_commands_emit_one_path_flag_per_declared_path() -> None:
+    config = {
+        "helper_path": "/usr/local/bin/service-registry",
+        "data_path": "/var/lib/common-services/registry.json",
+        "static_range": [8700, 8799],
+        "dynamic_range": [8800, 8999],
+        "entries": [
+            {
+                "service_id": "wingman",
+                "display_name": "Wingman",
+                "owner": "dhk",
+                "protocol": "tcp",
+                "address": "127.0.0.1",
+                "port": 8789,
+                "route": {
+                    "mode": "funnel",
+                    "host": "tailscale-self",
+                    "https_port": 443,
+                    "paths": ["/", "/shared"],
+                    "target": "http://127.0.0.1:8789",
+                },
+            }
+        ],
+    }
+
+    route_command = _registry_commands(config)[1]
+
+    assert [
+        route_command[index + 1] for index, value in enumerate(route_command) if value == "--path"
+    ] == ["/", "/shared"]
+
+
+def test_registry_component_check_accepts_a_reservation_fronting_several_paths(
+    tmp_path: Path,
+) -> None:
+    data_path = tmp_path / "registry.json"
+    helper = tmp_path / "service-registry"
+    helper.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+    routes = [
+        {
+            "mode": "funnel",
+            "host": "tailscale-self",
+            "https_port": 443,
+            "path": path,
+            "target": "http://127.0.0.1:8789",
+        }
+        for path in ("/", "/shared")
+    ]
+    data_path.write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "services": {
+                    "wingman": {
+                        "endpoint": {"protocol": "tcp", "address": "127.0.0.1", "port": 8789},
+                        "route": routes[0],
+                        "routes": routes,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    declaration = {
+        "service_id": "wingman",
+        "protocol": "tcp",
+        "address": "127.0.0.1",
+        "port": 8789,
+        "route": {
+            "mode": "funnel",
+            "host": "tailscale-self",
+            "https_port": 443,
+            "paths": ["/", "/shared"],
+            "target": "http://127.0.0.1:8789",
+        },
+    }
+    config = {"helper_path": str(helper), "data_path": str(data_path), "entries": [declaration]}
+
+    assert service_registry_state(config)[0] is True
+
+    # Losing one of the two paths is a difference, not a rounding error.
+    partial = json.loads(data_path.read_text(encoding="utf-8"))
+    partial["services"]["wingman"]["routes"] = routes[:1]
+    data_path.write_text(json.dumps(partial), encoding="utf-8")
+
+    ok, detail = service_registry_state(config)
+    assert ok is False
+    assert "external route differs" in detail
 
 
 def test_registry_helper_refuses_unknown_noninteractive_replacement(tmp_path: Path) -> None:
