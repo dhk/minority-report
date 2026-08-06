@@ -35,6 +35,7 @@ from deploy.install import (
     discard_unit_backups,
     ensure_environment_file,
     ensure_secrets,
+    environment_preview,
     existing_environment_value,
     install_root_needs_adoption,
     install_support,
@@ -591,6 +592,78 @@ def test_registry_check_ignores_services_this_pack_does_not_declare(tmp_path: Pa
 
     assert ok is True
     assert "1 declared services reserved" in detail
+
+
+def _env_file(tmp_path: Path, body: str) -> Path:
+    path = tmp_path / "tool.env"
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+def test_dry_run_preview_names_the_data_repository_and_where_it_came_from(
+    tmp_path: Path,
+) -> None:
+    """#14: the preview meant to catch a wrong corpus was silent on the corpus."""
+    env_file = _env_file(tmp_path, "SAMPLE_REPO=/srv/corpus\n")
+
+    lines = environment_preview(
+        {"SAMPLE_REPO": "/srv/corpus", "SAMPLE_DATA_DIR": "/srv/data"},
+        env_file,
+        repo_variable="SAMPLE_REPO",
+        repo_source="preserved from the host file",
+    )
+
+    assert "  SAMPLE_REPO: /srv/corpus  (unchanged; preserved from the host file)" in lines
+    assert "  SAMPLE_DATA_DIR: /srv/data  (new)" in lines
+
+
+def test_dry_run_preview_marks_a_value_the_install_would_change(tmp_path: Path) -> None:
+    env_file = _env_file(tmp_path, "SAMPLE_REPO=/srv/old-corpus\n")
+
+    lines = environment_preview(
+        {"SAMPLE_REPO": "/srv/new-corpus"},
+        env_file,
+        repo_variable="SAMPLE_REPO",
+        repo_source="from --repo-path",
+    )
+
+    assert lines == [
+        "  SAMPLE_REPO: /srv/new-corpus  (CHANGED, was /srv/old-corpus; from --repo-path)"
+    ]
+
+
+def test_dry_run_preview_warns_when_the_corpus_sits_inside_the_install_root(
+    tmp_path: Path,
+) -> None:
+    """The #6 failure, visible before the install rather than after it."""
+    install_root = tmp_path / "install"
+    env_file = _env_file(tmp_path, "")
+
+    lines = environment_preview(
+        {"SAMPLE_REPO": str(install_root / "current")},
+        env_file,
+        repo_variable="SAMPLE_REPO",
+        install_root=install_root,
+    )
+
+    assert any("WARNING" in line and "inside the install root" in line for line in lines)
+    assert any("stale content" in line for line in lines)
+
+
+def test_dry_run_preview_stays_quiet_for_a_corpus_outside_the_install_root(
+    tmp_path: Path,
+) -> None:
+    install_root = tmp_path / "install"
+    env_file = _env_file(tmp_path, "")
+
+    lines = environment_preview(
+        {"SAMPLE_REPO": str(tmp_path / "corpus")},
+        env_file,
+        repo_variable="SAMPLE_REPO",
+        install_root=install_root,
+    )
+
+    assert not any("WARNING" in line for line in lines)
 
 
 def test_registry_helper_refuses_unknown_noninteractive_replacement(tmp_path: Path) -> None:

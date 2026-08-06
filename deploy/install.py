@@ -132,8 +132,7 @@ def prompt_install_root(
             return candidate
         print("  left alone; nothing was created.", file=stream)
     raise InstallError(
-        f"no usable install root after {attempts} attempts; "
-        "pass --install-root explicitly instead"
+        f"no usable install root after {attempts} attempts; pass --install-root explicitly instead"
     )
 
 
@@ -236,6 +235,51 @@ def existing_environment_value(path: Path, name: str) -> str | None:
         if key.strip() == name:
             return value.strip().strip("\"'") or None
     return None
+
+
+def environment_preview(
+    managed: Mapping[str, str],
+    environment_file: Path,
+    *,
+    repo_variable: str = "",
+    repo_source: str = "",
+    install_root: Path | None = None,
+) -> list[str]:
+    """One line per managed setting: its resolved value, and what changes.
+
+    The dry run exists to catch a wrong data repository before it is installed,
+    and it printed every path on the host except that one (#14). Where the
+    value came from matters as much as the value: 'preserved from the host
+    file' and 'you passed --repo-path' look identical in the result and are
+    very different mistakes.
+    """
+    lines: list[str] = []
+    for name in sorted(managed):
+        value = managed[name]
+        current = existing_environment_value(environment_file, name)
+        if current is None:
+            change = "new"
+        elif current == value:
+            change = "unchanged"
+        else:
+            change = f"CHANGED, was {current}"
+        notes = [change]
+        if name == repo_variable and repo_source:
+            notes.append(repo_source)
+        lines.append(f"  {name}: {value}  ({'; '.join(notes)})")
+        if name == repo_variable and install_root is not None:
+            resolved = Path(value)
+            if resolved == install_root or install_root in resolved.parents:
+                # The failure #6 fixed, made visible before the install rather
+                # than after: a server reading the frozen copy of the data
+                # captured inside its own release reports healthy while
+                # serving content that can no longer change.
+                lines.append(
+                    f"    WARNING: this is inside the install root ({install_root}). "
+                    "The service would read a frozen copy of the data captured in the "
+                    "release and report healthy while serving stale content."
+                )
+    return lines
 
 
 def _resolve_external_repo(flag_value: Path | None, existing: str | None) -> Path | None:
@@ -1026,14 +1070,19 @@ def main(argv: list[str] | None = None) -> int:
         repo_variable = str(install["repo_environment"])
         if bool(install.get("repo_is_install_root", True)):
             managed_environment[repo_variable] = str(current)
+            repo_source = "from this pack's install root"
         else:
             # The code and the data it reads are different repositories, so the
             # install root says nothing about where the data lives. Pointing
             # this at ``current`` would aim it at a frozen copy of the data
             # captured inside the release -- which reads as a working server
             # serving silently stale content, the worst available failure.
-            resolved_repo = _resolve_external_repo(
-                args.repo_path, existing_environment_value(environment_file, repo_variable)
+            configured_repo = existing_environment_value(environment_file, repo_variable)
+            resolved_repo = _resolve_external_repo(args.repo_path, configured_repo)
+            repo_source = (
+                "from --repo-path"
+                if args.repo_path is not None
+                else f"preserved from {environment_file}"
             )
             if resolved_repo is None:
                 raise InstallError(
@@ -1102,6 +1151,14 @@ def main(argv: list[str] | None = None) -> int:
                 f"Host config: {environment_file} "
                 f"({'requires update' if environment_needs_update else 'current'})"
             )
+            for line in environment_preview(
+                managed_environment,
+                environment_file,
+                repo_variable=repo_variable,
+                repo_source=repo_source,
+                install_root=install_root,
+            ):
+                print(line)
             print(f"Secrets: {secrets_file}")
             print("Services: " + ", ".join(str(item["unit"]) for item in services))
             print(
