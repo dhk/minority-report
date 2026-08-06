@@ -116,6 +116,55 @@ def mcp_processes(processes: list[ProcessInfo] | None = None) -> list[ProcessInf
     ]
 
 
+def running_service(
+    processes: list[ProcessInfo] | None = None,
+) -> ProcessInfo | None:
+    """This account's running HTTP server, if there is one."""
+    return next((process for process in mcp_processes(processes) if process.is_http), None)
+
+
+def service_invocation(process: ProcessInfo | None) -> dict[str, str]:
+    """The flags the running server was actually started with.
+
+    ``alexandria-ctl`` is a different process from the server, so re-deriving
+    ``--tunnel-path``/``--port`` from its own environment produces a confident
+    description of a service that is not the one running. That is #4: the unit
+    passes ``--tunnel-path /alexandria``, an interactive ``url`` saw nothing,
+    and the URL it printed reached a different service entirely.
+    """
+    if process is None:
+        return {}
+    tokens = process.command.split()
+    found: dict[str, str] = {}
+    for flag in ("--port", "--tunnel-path", "--tunnel-port", "--host"):
+        if flag in tokens:
+            index = tokens.index(flag)
+            if index + 1 < len(tokens):
+                found[flag] = tokens[index + 1]
+    return found
+
+
+def service_repo(process: ProcessInfo | None) -> str | None:
+    """The corpus the running server actually opened, when it can be read.
+
+    Read from the process's own environment. ``/proc`` is Linux-only and
+    readable here only because the server runs as this same account; anywhere
+    else this returns None and callers fall back to their own resolution
+    rather than asserting something they cannot see.
+    """
+    if process is None:
+        return None
+    try:
+        raw = Path(f"/proc/{process.pid}/environ").read_bytes()
+    except OSError:
+        return None
+    for entry in raw.split(b"\0"):
+        name, separator, value = entry.decode("utf-8", "replace").partition("=")
+        if separator and name == ENV_REPO_ROOT and value:
+            return value
+    return None
+
+
 def _systemd_command(action: str) -> list[str]:
     return ["systemctl", "--user", action, _SERVICE_UNIT]
 
@@ -275,11 +324,43 @@ def cycle(repo: Path, host: str, port: int, *, stream: TextIO = sys.stdout) -> b
     return healthy
 
 
+def _served_corpus_lines(
+    served: str,
+    process: ProcessInfo | None,
+    *,
+    cli_answer: Path | None,
+) -> list[str]:
+    """Report the corpus the running server opened, and any disagreement.
+
+    A disagreement is not a footnote: it means every other line of this
+    command describes a corpus nobody is serving.
+    """
+    pid = f" (pid {process.pid})" if process is not None else ""
+    lines = [f"Repo: {served} — as opened by the running server{pid}"]
+    if cli_answer is not None:
+        lines.append(f"  WARNING: this command's own environment resolves {cli_answer} instead.")
+        lines.append("  The server is the authority; the difference is worth resolving.")
+    served_path = Path(served)
+    if not served_path.is_dir():
+        lines.append("Investigations: unknown (that path does not exist)")
+        return lines
+    research = served_path / "research"
+    if not research.is_dir():
+        lines.append("Investigations: 0 (no research/ directory yet)")
+        return lines
+    try:
+        lines.append(f"Investigations: {sum(1 for entry in research.iterdir() if entry.is_dir())}")
+    except OSError as exc:
+        lines.append(f"Investigations: unreadable ({exc})")
+    return lines
+
+
 def _corpus_lines(
     env: dict[str, str] | os._Environ[str] | None = None,
     *,
     host_env_file: Path | None = None,
     cwd: Path | None = None,
+    process: ProcessInfo | None = None,
 ) -> list[str]:
     """Describe the corpus this CLI resolves, without ever raising.
 
@@ -287,16 +368,23 @@ def _corpus_lines(
     corpus that cannot be resolved or read is reported on the line rather than
     ending the run.
 
-    This reports the CLI's own resolution, which is not necessarily the corpus
-    the running service opened — see #4 for the same re-derivation making
-    ``url`` wrong. The service is the authority; this is a diagnostic.
+    When a server is running and its environment is readable, that is the
+    corpus reported: it is the one actually being served. The CLI's own
+    resolution is reported alongside it only when the two disagree, because a
+    disagreement is the interesting case and silence about it is what made
+    ``url`` confidently wrong (#4).
     """
+    served = service_repo(process)
     try:
         config = load_config(env, cwd=cwd, host_env_file=host_env_file)
     except RepoNotFoundError:
+        if served:
+            return _served_corpus_lines(served, process, cli_answer=None)
         return [f"Repo: not configured (set {ENV_REPO_ROOT})"]
     except OSError as exc:
         return [f"Repo: unreadable ({exc})"]
+    if served and Path(served).resolve() != config.repo_root.resolve():
+        return _served_corpus_lines(served, process, cli_answer=config.repo_root)
     repo = config.repo_root
     if not repo.is_dir():
         # Distinguished from an empty corpus deliberately: a pointer at a path
@@ -322,9 +410,10 @@ def _print_status(
     cwd: Path | None = None,
 ) -> None:
     print(f"Alexandria {service_version()}", file=stream)
-    for line in _corpus_lines(env, host_env_file=host_env_file, cwd=cwd):
-        print(line, file=stream)
     processes = mcp_processes()
+    server = next((item for item in processes if item.is_http), None)
+    for line in _corpus_lines(env, host_env_file=host_env_file, cwd=cwd, process=server):
+        print(line, file=stream)
     if not processes:
         print("Processes: none", file=stream)
     for process in processes:
@@ -343,6 +432,7 @@ def _print_urls(
     *,
     repo: Path | None = None,
     stream: TextIO = sys.stdout,
+    process: ProcessInfo | None = None,
 ) -> None:
     from alexandria.mcp_server import (
         _extra_allowed_hosts,
@@ -351,6 +441,17 @@ def _print_urls(
         _tunnel_port,
         render_urls,
     )
+
+    # What the server is actually serving beats what this process would guess.
+    # An explicit flag still wins over both -- the operator may be asking about
+    # a server that is not running yet.
+    invocation = service_invocation(process)
+    described = ""
+    if tunnel_path is None and "--tunnel-path" in invocation:
+        tunnel_path = invocation["--tunnel-path"]
+        described = f"pid {process.pid}" if process is not None else ""
+    if tunnel_port is None and "--tunnel-port" in invocation:
+        tunnel_port = int(invocation["--tunnel-port"])
 
     environment = None
     if repo is not None:
@@ -367,6 +468,8 @@ def _print_urls(
         tunnel_port=_tunnel_port(tunnel_port),
     ):
         print(line, file=stream)
+    if described:
+        print(f"(tunnel path read from the running server, {described})", file=stream)
     if not hosts:
         print(
             "(no tunnel hostname detected — is Tailscale up, or is ALEXANDRIA_ALLOWED_HOSTS set?)",
@@ -398,6 +501,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.tunnel_path,
                 args.tunnel_port,
                 repo=args.repo,
+                process=running_service(),
             )
         elif args.command == "start":
             assert repo is not None

@@ -118,6 +118,136 @@ def test_a_corpus_without_a_research_directory_says_so_rather_than_just_zero(
     assert lines == [f"Repo: {repo}", "Investigations: 0 (no research/ directory yet)"]
 
 
+def _server(command: str, pid: int = 4242) -> control.ProcessInfo:
+    return control.ProcessInfo(pid=pid, uid=0, tty="??", command=command)
+
+
+def test_the_running_servers_flags_are_read_from_its_command_line() -> None:
+    """#4: ctl re-derived --tunnel-path from its own environment and got it wrong."""
+    process = _server(
+        "/home/dhk/.local/bin/alexandria-mcp --http --port 8797 --tunnel-path /alexandria"
+    )
+
+    assert control.service_invocation(process) == {
+        "--port": "8797",
+        "--tunnel-path": "/alexandria",
+    }
+
+
+def test_no_running_server_means_no_flags_to_borrow() -> None:
+    assert control.service_invocation(None) == {}
+
+
+def test_a_trailing_flag_without_a_value_is_ignored() -> None:
+    process = _server("alexandria-mcp --http --tunnel-path")
+
+    assert control.service_invocation(process) == {}
+
+
+def test_url_uses_the_tunnel_path_the_server_is_running_with(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "corpus"
+    (repo / "research").mkdir(parents=True)
+    monkeypatch.setenv("ALEXANDRIA_REPO", str(repo))
+    monkeypatch.setenv("ALEXANDRIA_DATA_DIR", str(tmp_path / "data"))
+    stream = io.StringIO()
+
+    control._print_urls(
+        "127.0.0.1",
+        8797,
+        None,
+        None,
+        stream=stream,
+        process=_server("alexandria-mcp --http --port 8797 --tunnel-path /alexandria"),
+    )
+
+    output = stream.getvalue()
+    assert "/alexandria/mcp/" in output
+    assert "tunnel path read from the running server, pid 4242" in output
+
+
+def test_an_explicit_tunnel_path_still_wins_over_the_running_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The operator may be asking about a server that is not this one."""
+    repo = tmp_path / "corpus"
+    (repo / "research").mkdir(parents=True)
+    monkeypatch.setenv("ALEXANDRIA_REPO", str(repo))
+    monkeypatch.setenv("ALEXANDRIA_DATA_DIR", str(tmp_path / "data"))
+    stream = io.StringIO()
+
+    control._print_urls(
+        "127.0.0.1",
+        8797,
+        "/elsewhere",
+        None,
+        stream=stream,
+        process=_server("alexandria-mcp --http --tunnel-path /alexandria"),
+    )
+
+    output = stream.getvalue()
+    assert "/elsewhere/mcp/" in output
+    assert "read from the running server" not in output
+
+
+def test_status_reports_the_corpus_the_server_opened_when_they_disagree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#20's stated limitation: status reported the CLI's answer, confidently."""
+    served = tmp_path / "served"
+    (served / "research" / "one").mkdir(parents=True)
+    cli_repo = tmp_path / "what-the-cli-thinks"
+    (cli_repo / "research").mkdir(parents=True)
+    process = _server("alexandria-mcp --http")
+    monkeypatch.setattr(control, "service_repo", lambda _process: str(served))
+
+    lines = control._corpus_lines(
+        {"ALEXANDRIA_REPO": str(cli_repo)},
+        host_env_file=tmp_path / "missing.env",
+        cwd=tmp_path,
+        process=process,
+    )
+
+    assert lines[0] == f"Repo: {served} — as opened by the running server (pid 4242)"
+    assert any("WARNING" in line and str(cli_repo) in line for line in lines)
+    assert "Investigations: 1" in lines
+
+
+def test_status_stays_quiet_when_the_server_and_the_cli_agree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "corpus"
+    (repo / "research" / "one").mkdir(parents=True)
+    monkeypatch.setattr(control, "service_repo", lambda _process: str(repo))
+
+    lines = control._corpus_lines(
+        {"ALEXANDRIA_REPO": str(repo)},
+        host_env_file=tmp_path / "missing.env",
+        cwd=tmp_path,
+        process=_server("alexandria-mcp --http"),
+    )
+
+    assert lines == [f"Repo: {repo}", "Investigations: 1"]
+    assert not any("WARNING" in line for line in lines)
+
+
+def test_a_served_corpus_that_is_gone_is_not_reported_as_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(control, "service_repo", lambda _process: str(tmp_path / "absent"))
+
+    lines = control._corpus_lines(
+        {"ALEXANDRIA_REPO": str(tmp_path)},
+        host_env_file=tmp_path / "missing.env",
+        cwd=tmp_path,
+        process=_server("alexandria-mcp --http"),
+    )
+
+    assert "Investigations: unknown (that path does not exist)" in lines
+    assert not any("Investigations: 0" in line for line in lines)
+
+
 def test_default_repo_prefers_environment(tmp_path: Path) -> None:
     assert (
         control._default_repo(
