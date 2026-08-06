@@ -563,6 +563,34 @@ def build_transport_security(extra_hosts: Sequence[str]) -> TransportSecuritySet
     )
 
 
+def _port_available(host: str, port: int) -> str | None:
+    """Ask the port question the way the server that follows will ask it.
+
+    Returns None when the port is bindable, otherwise the OS error text.
+
+    ``SO_REUSEADDR`` is not a nicety here. asyncio's ``create_server`` —
+    which uvicorn runs underneath — sets it on POSIX, so a socket the
+    kernel is holding in TIME_WAIT after a client disconnected is not a
+    conflict for the server. A probe without it disagrees with the server
+    it is guarding: it reports "address already in use" and exits, for a
+    port uvicorn would have bound straight through. Measured on lobster,
+    that disagreement lasted 62 seconds after a real client detached —
+    against the installer's 15-second health window, which is how it
+    failed two installs that were themselves fine.
+
+    A port held by a live listener still fails, which is the case this
+    probe exists to catch.
+    """
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    with socket.socket(family, socket.SOCK_STREAM) as probe:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            probe.bind((host, port))
+        except OSError as exc:
+            return exc.strerror or str(exc)
+    return None
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="alexandria-mcp",
@@ -632,17 +660,14 @@ def main(argv: list[str] | None = None) -> None:
             file=sys.stderr,
         )
         sys.exit(1)
-    family = socket.AF_INET6 if ":" in args.host else socket.AF_INET
-    with socket.socket(family, socket.SOCK_STREAM) as probe:
-        try:
-            probe.bind((args.host, args.port))
-        except OSError as exc:
-            print(
-                f"ERROR: cannot bind {args.host}:{args.port} ({exc.strerror}). "
-                f"Something else holds the port — find it with: lsof -ti :{args.port}",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+    unavailable = _port_available(args.host, args.port)
+    if unavailable is not None:
+        print(
+            f"ERROR: cannot bind {args.host}:{args.port} ({unavailable}). "
+            f"Something else holds the port — find it with: lsof -ti :{args.port}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     token = _http_token(config, rotate=args.rotate_token)
     server.settings.host = args.host
     server.settings.port = args.port
