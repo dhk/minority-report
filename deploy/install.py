@@ -23,7 +23,7 @@ import urllib.request
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 from deploy.checks import (
     print_component_panel,
@@ -39,6 +39,7 @@ class InstallError(RuntimeError):
 
 Runner = Callable[[Sequence[str]], None]
 _PACK_ROOT_MARKER = ".tool-pack-root.json"
+_INSTALL_ROOT_ATTEMPTS = 3
 _SUPPORT_MARKER = ".tool-pack-support.json"
 _REGISTRY_MARKER = "common-services-registry-format: 1"
 
@@ -63,6 +64,75 @@ def _expanded(path: str) -> Path:
 def _prompt_path(prompt: str, default: Path, input_fn: Callable[[str], str]) -> Path:
     answer = input_fn(f"{prompt} [{default}]: ").strip()
     return _expanded(answer) if answer else default
+
+
+def resolve_install_root(answer: str, *, bundle_root: Path) -> Path:
+    """Validate an operator-supplied install root, or refuse it.
+
+    A relative answer is rejected, never resolved against the working
+    directory.  That silent absolutisation is the defect: a password typed at
+    the ``Install root`` prompt became a real directory under whichever
+    repository the operator happened to be standing in.
+
+    Rejection messages never quote the answer back.  Until it has been proven
+    absolute it may not be a path at all, and this runs a line or two above a
+    sudo prompt.
+    """
+    text = answer.strip()
+    if not text:
+        raise InstallError("install root cannot be empty")
+    candidate = Path(os.path.expandvars(text)).expanduser()
+    if not candidate.is_absolute():
+        raise InstallError("install root must be an absolute path, starting with '/' or '~/'")
+    # Only past this point is the answer known to be a path, and so safe to echo.
+    resolved = candidate.resolve()
+    bundle = bundle_root.resolve()
+    if resolved == bundle or bundle in resolved.parents:
+        raise InstallError(f"install root must not be inside the bundle: {resolved}")
+    if resolved.exists() and not resolved.is_dir():
+        raise InstallError(f"install root exists but is not a directory: {resolved}")
+    if not resolved.parent.is_dir():
+        raise InstallError(f"parent directory does not exist: {resolved.parent}")
+    return resolved
+
+
+def prompt_install_root(
+    default: Path,
+    *,
+    bundle_root: Path,
+    input_fn: Callable[[str], str] = input,
+    stream: TextIO = sys.stdout,
+    attempts: int = _INSTALL_ROOT_ATTEMPTS,
+) -> Path:
+    """Ask for an install root, re-prompting until one validates.
+
+    An unusable answer is refused and asked again rather than turned into a
+    directory, and a root that does not exist yet is created only on an
+    explicit confirmation.
+    """
+    print(
+        "Install root: the directory this tool is installed into.\n"
+        "This asks for a directory, not a password.",
+        file=stream,
+    )
+    for _ in range(attempts):
+        answer = input_fn(f"Install root [{default}]: ").strip()
+        if not answer:
+            return default
+        try:
+            candidate = resolve_install_root(answer, bundle_root=bundle_root)
+        except InstallError as exc:
+            print(f"  rejected: {exc}", file=stream)
+            continue
+        if candidate.exists():
+            return candidate
+        if _confirm(f"Create new install root {candidate}?", default=False, input_fn=input_fn):
+            return candidate
+        print("  left alone; nothing was created.", file=stream)
+    raise InstallError(
+        f"no usable install root after {attempts} attempts; "
+        "pass --install-root explicitly instead"
+    )
 
 
 def _confirm(prompt: str, *, default: bool, input_fn: Callable[[str], str] = input) -> bool:
@@ -836,11 +906,11 @@ def main(argv: list[str] | None = None) -> int:
             raise InstallError("pack manifest install/tool sections must be objects")
         default_root = _expanded(str(install["default_root"]))
         if args.install_root:
-            install_root = args.install_root.expanduser().resolve()
+            install_root = resolve_install_root(str(args.install_root), bundle_root=bundle_root)
         elif args.yes or args.dry_run:
             install_root = default_root
         else:
-            install_root = _prompt_path("Install root", default_root, input)
+            install_root = prompt_install_root(default_root, bundle_root=bundle_root)
         releases = install_root / "releases"
         current = install_root / "current"
         source = bundle_root / "source"
