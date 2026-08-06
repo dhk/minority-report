@@ -28,6 +28,7 @@ from typing import Any
 from deploy.checks import (
     print_component_panel,
     required_checks_pass,
+    route_paths,
     run_component_checks,
     tailscale_route_state,
 )
@@ -591,23 +592,26 @@ def _registry_commands(config: Mapping[str, Any]) -> list[list[str]]:
         commands.append(command)
         route = entry.get("route")
         if isinstance(route, dict):
-            commands.append(
+            command = [
+                *base,
+                "reserve-route",
+                str(entry["service_id"]),
+                "--host",
+                str(route["host"]),
+                "--https-port",
+                str(route["https_port"]),
+            ]
+            for path in route_paths(route):
+                command.extend(["--path", path])
+            command.extend(
                 [
-                    *base,
-                    "reserve-route",
-                    str(entry["service_id"]),
-                    "--host",
-                    str(route["host"]),
-                    "--https-port",
-                    str(route["https_port"]),
-                    "--path",
-                    str(route["path"]),
                     "--mode",
                     str(route["mode"]),
                     "--target",
                     str(route["target"]),
                 ]
             )
+            commands.append(command)
     return commands
 
 

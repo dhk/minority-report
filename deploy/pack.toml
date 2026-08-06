@@ -53,37 +53,26 @@ static_range = [8700, 8799]
 dynamic_range = [8800, 8999]
 required = true
 
+# Wingman is multi-user: one service on 8789 fronting both '/' and '/shared'.
+# The per-user split (dhk on 8787, trent on 8788 at '/trent') is gone; nothing
+# listens on either port. Declared here only because dhk/wingman has no pack of
+# its own yet, so nothing else would claim 8789 or its paths in the shared
+# registry. It belongs in dhk/wingman — see #21.
 [[registry.entries]]
 service_id = "wingman"
 display_name = "Wingman"
 owner = "dhk"
 protocol = "tcp"
 address = "127.0.0.1"
-port = 8787
+port = 8789
 unit = "wingman-mcp.service"
 source = "dhk/wingman"
 adopt_listener = true
 route_mode = "funnel"
 route_host = "tailscale-self"
 route_https_port = 443
-route_path = "/"
-route_target = "http://127.0.0.1:8787"
-
-[[registry.entries]]
-service_id = "wingman-trent"
-display_name = "Wingman (Trent)"
-owner = "trent"
-protocol = "tcp"
-address = "127.0.0.1"
-port = 8788
-unit = "wingman-mcp.service"
-source = "dhk/wingman"
-adopt_listener = true
-route_mode = "funnel"
-route_host = "tailscale-self"
-route_https_port = 443
-route_path = "/trent"
-route_target = "http://127.0.0.1:8788"
+route_paths = ["/", "/shared"]
+route_target = "http://127.0.0.1:8789"
 
 [[registry.entries]]
 service_id = "alexandria"
@@ -100,5 +89,5 @@ adopt_listener = true
 route_mode = "funnel"
 route_host = "tailscale-self"
 route_https_port = 443
-route_path = "/alexandria"
+route_paths = ["/alexandria"]
 route_target = "http://127.0.0.1:8797"

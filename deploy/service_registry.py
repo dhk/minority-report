@@ -23,7 +23,7 @@ import sys
 import tempfile
 import urllib.error
 import urllib.request
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -263,6 +263,20 @@ def _endpoint_conflict(
     return None
 
 
+def entry_routes(entry: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Every route an entry holds.
+
+    Entries carry a ``routes`` list so one endpoint can front several paths.
+    ``route`` is kept alongside it, holding the first, so readers written
+    against the single-route shape keep working.
+    """
+    routes = entry.get("routes")
+    if isinstance(routes, list):
+        return [item for item in routes if isinstance(item, dict)]
+    route = entry.get("route")
+    return [route] if isinstance(route, dict) else []
+
+
 def _route_conflict(
     services: Mapping[str, Any],
     service_id: str,
@@ -273,15 +287,13 @@ def _route_conflict(
     for owner_id, raw in services.items():
         if owner_id == service_id or not isinstance(raw, dict):
             continue
-        route = raw.get("route")
-        if not isinstance(route, dict):
-            continue
-        if (
-            route.get("host") == host
-            and route.get("https_port") == https_port
-            and route.get("path") == path
-        ):
-            return str(owner_id)
+        for route in entry_routes(raw):
+            if (
+                route.get("host") == host
+                and route.get("https_port") == https_port
+                and route.get("path") == path
+            ):
+                return str(owner_id)
     return None
 
 
@@ -364,7 +376,8 @@ def reserve_service(
                 "when importing the known owner"
             )
         created_at = existing.get("created_at") if isinstance(existing, dict) else _now()
-        route = existing.get("route") if isinstance(existing, dict) else None
+        routes = entry_routes(existing) if isinstance(existing, dict) else []
+        route = routes[0] if routes else None
         entry = {
             "service_id": service_id,
             "display_name": display_name,
@@ -379,6 +392,7 @@ def reserve_service(
             },
             "health": ({"url": health_url, "service": health_service} if health_url else None),
             "route": route,
+            "routes": routes,
             "created_at": created_at,
             "updated_at": _now(),
         }
@@ -396,37 +410,49 @@ def reserve_route(
     service_id: str,
     host: str,
     https_port: int,
-    path: str,
+    paths: Sequence[str],
     mode: str,
     target: str,
 ) -> dict[str, Any]:
     service_id = _service(service_id)
     if mode not in {"serve", "funnel"}:
         raise RegistryError("route mode must be serve or funnel")
+    if not paths:
+        raise RegistryError("a route needs at least one path")
     https_port = _valid_port(https_port) if https_port != 443 else 443
-    path = normalize_path(path)
+    normalized: list[str] = []
+    for candidate in paths:
+        value = normalize_path(candidate)
+        if value in normalized:
+            raise RegistryError(f"path is declared twice: {value}")
+        normalized.append(value)
     with store.mutate() as data:
         services = data["services"]
         assert isinstance(services, dict)
         entry = services.get(service_id)
         if not isinstance(entry, dict):
             raise RegistryError(f"reserve {service_id}'s local endpoint before its route")
-        conflict = _route_conflict(services, service_id, host, https_port, path)
-        if conflict:
-            raise RegistryError(f"https://{host}:{https_port}{path} is reserved by {conflict}")
-        route = {
-            "mode": mode,
-            "host": host,
-            "https_port": https_port,
-            "path": path,
-            "target": target,
-        }
-        existing = entry.get("route")
-        if existing is not None and existing != route:
-            raise RegistryError(
-                f"{service_id} already has a different route; migrate it explicitly"
-            )
-        entry["route"] = route
+        for path in normalized:
+            conflict = _route_conflict(services, service_id, host, https_port, path)
+            if conflict:
+                raise RegistryError(f"https://{host}:{https_port}{path} is reserved by {conflict}")
+        routes = [
+            {
+                "mode": mode,
+                "host": host,
+                "https_port": https_port,
+                "path": path,
+                "target": target,
+            }
+            for path in normalized
+        ]
+        existing = entry_routes(entry)
+        if existing and existing != routes:
+            raise RegistryError(f"{service_id} already has different routes; migrate it explicitly")
+        entry["routes"] = routes
+        # Kept in step so readers written against the single-route shape,
+        # including older copies of this helper, still see a route.
+        entry["route"] = routes[0]
         entry["updated_at"] = _now()
         return entry
 
@@ -545,12 +571,14 @@ def observe_service(entry: Mapping[str, Any]) -> dict[str, Any]:
     health_ok, health_detail = (
         _health_ready(health_value) if isinstance(health_value, dict) else (None, "not configured")
     )
-    route_value = entry.get("route")
-    route_ok, route_detail = (
-        _tailscale_status(route_value)
-        if isinstance(route_value, dict)
-        else (None, "not configured")
-    )
+    routes = entry_routes(entry)
+    if routes:
+        observed = [_tailscale_status(route) for route in routes]
+        route_ok = all(ok for ok, _ in observed)
+        # Report every path, so one broken route in a set is not averaged away.
+        route_detail = " · ".join(detail for _, detail in observed)
+    else:
+        route_ok, route_detail = None, "not configured"
     unit_ok, unit_detail = _unit_status(str(entry.get("owner", "")), str(entry.get("unit") or ""))
     required = [listener]
     if health_ok is not None:
@@ -655,7 +683,7 @@ def build_parser() -> argparse.ArgumentParser:
     route.add_argument("service_id")
     route.add_argument("--host", required=True)
     route.add_argument("--https-port", type=int, default=443)
-    route.add_argument("--path", required=True)
+    route.add_argument("--path", action="append", dest="paths", required=True)
     route.add_argument("--mode", choices=["serve", "funnel"], required=True)
     route.add_argument("--target", required=True)
 
@@ -702,7 +730,7 @@ def main(argv: list[str] | None = None) -> int:
                 service_id=args.service_id,
                 host=args.host,
                 https_port=args.https_port,
-                path=args.path,
+                paths=args.paths,
                 mode=args.mode,
                 target=args.target,
             )
