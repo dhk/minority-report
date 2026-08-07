@@ -22,6 +22,7 @@ import urllib.error
 import urllib.request
 import uuid
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -513,6 +514,26 @@ def _healthy(url: str, expected_service: str, timeout_seconds: float = 15.0) -> 
     return False
 
 
+@dataclass(frozen=True)
+class UnitWrite:
+    """One systemd unit this install touched, and how to put it back.
+
+    A failed install used to leave rewritten units behind while reporting a
+    clean rollback, so the host ended up in a third state that was neither the
+    old install nor the new one (#12). Undoing that needs the displaced
+    content, not just the unit's name.
+    """
+
+    unit: str
+    path: Path
+    backup: Path | None = None
+    created: bool = False
+
+    @property
+    def changed(self) -> bool:
+        return self.created or self.backup is not None
+
+
 def _write_units(
     services: Sequence[Mapping[str, Any]],
     *,
@@ -520,10 +541,10 @@ def _write_units(
     current: Path,
     environment_file: Path,
     secrets_file: Path,
-) -> list[str]:
+) -> list[UnitWrite]:
     unit_dir = home / ".config" / "systemd" / "user"
     unit_dir.mkdir(parents=True, exist_ok=True)
-    units: list[str] = []
+    writes: list[UnitWrite] = []
     for service in services:
         unit = str(service["unit"])
         path = unit_dir / unit
@@ -536,16 +557,49 @@ def _write_units(
         )
         existing = path.read_text(encoding="utf-8") if path.is_file() else None
         if existing == desired:
-            units.append(unit)
+            writes.append(UnitWrite(unit=unit, path=path))
             continue
+        backup: Path | None = None
         if existing is not None:
             timestamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
             backup = path.with_name(f"{path.name}.bak-{timestamp}-{uuid.uuid4().hex[:6]}")
             shutil.copy2(path, backup)
             print(f"  preserved previous unit: {backup}")
         path.write_text(desired, encoding="utf-8")
-        units.append(unit)
-    return units
+        writes.append(
+            UnitWrite(unit=unit, path=path, backup=backup, created=existing is None)
+        )
+    return writes
+
+
+def restore_units(writes: Sequence[UnitWrite]) -> list[str]:
+    """Put displaced unit files back. Returns what could not be restored."""
+    failures: list[str] = []
+    for write in writes:
+        try:
+            if write.backup is not None:
+                shutil.copy2(write.backup, write.path)
+            elif write.created and write.path.exists():
+                write.path.unlink()
+        except OSError as exc:
+            failures.append(f"{write.path} ({exc})")
+    return failures
+
+
+def discard_unit_backups(writes: Sequence[UnitWrite]) -> None:
+    """Remove only the backups this run created.
+
+    Earlier runs' backups are left alone: they are somebody else's record of
+    somebody else's install, and one of them was how a password typed at the
+    wrong prompt survived on disk long after the install that captured it.
+    """
+    for write in writes:
+        if write.backup is None:
+            continue
+        try:
+            write.backup.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _confirm_replacement(
@@ -857,21 +911,60 @@ def _print_capability(
         print("  (Tailscale DNS name unavailable; tunnel URL omitted.)")
 
 
+def _report_rollback(reverted: Sequence[str], survived: Sequence[str]) -> None:
+    """Say what came back and what did not.
+
+    "The install failed" and "the host is unchanged" are different statements,
+    and reporting the first while meaning something between the two is what
+    made a failed install expensive to diagnose (#12).
+    """
+    if reverted:
+        print("Reverted: " + ", ".join(reverted) + ".", file=sys.stderr)
+    if not survived:
+        print("The host is back to its previous state.", file=sys.stderr)
+        return
+    print(
+        "NOT reverted — these host changes remain in place:",
+        file=sys.stderr,
+    )
+    for item in survived:
+        print(f"  - {item}", file=sys.stderr)
+
+
 def _rollback(
     previous: Path | None,
     *,
     current: Path,
     uv: str,
-    units: Sequence[str],
+    units: Sequence[UnitWrite],
     runner: Runner,
+    survived: Sequence[str] = (),
 ) -> None:
+    changed = [write for write in units if write.changed]
+    remaining = list(survived)
     if previous is None or not previous.is_dir():
         print("No earlier release was available for automatic rollback.", file=sys.stderr)
+        if changed:
+            remaining.insert(
+                0, "systemd units were rewritten: " + ", ".join(write.unit for write in changed)
+            )
+        _report_rollback([], remaining)
         return
     print(f"Rolling back to {previous.name}…", file=sys.stderr)
+    reverted: list[str] = []
     switch_current(current, previous)
+    reverted.append("release symlink")
     runner([uv, "tool", "install", "--reinstall", str(previous)])
-    _restart_units(units, runner)
+    reverted.append("installed commands")
+    if changed:
+        failures = restore_units(changed)
+        if failures:
+            remaining.insert(0, "systemd units could not be restored: " + ", ".join(failures))
+        else:
+            reverted.append("systemd units")
+            discard_unit_backups(changed)
+    _restart_units([write.unit for write in units], runner)
+    _report_rollback(reverted, remaining)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1106,7 +1199,11 @@ def main(argv: list[str] | None = None) -> int:
 
         ensure_environment_file(environment_file, managed_environment)
         switch_current(current, release)
-        units: list[str] = []
+        units: list[UnitWrite] = []
+        # Host-level changes an automatic rollback cannot undo: both need root,
+        # and both are shared with other services, so guessing at a revert is
+        # worse than saying plainly that they survived (#12).
+        survived: list[str] = []
         if not args.skip_service:
             if shutil.which("systemctl") is None:
                 raise InstallError(
@@ -1120,6 +1217,11 @@ def main(argv: list[str] | None = None) -> int:
                     input_fn=input,
                     runner=_default_runner,
                 )
+                if isinstance(manifest.get("registry"), dict):
+                    survived.append(
+                        "service registry reservations in "
+                        f"{manifest['registry'].get('data_path', 'the host registry')}"
+                    )
                 units = _write_units(
                     services,
                     home=Path.home(),
@@ -1127,7 +1229,7 @@ def main(argv: list[str] | None = None) -> int:
                     environment_file=environment_file,
                     secrets_file=secrets_file,
                 )
-                _restart_units(units, _default_runner)
+                _restart_units([write.unit for write in units], _default_runner)
                 failed = [
                     str(service["health_url"])
                     for service in services
@@ -1144,6 +1246,12 @@ def main(argv: list[str] | None = None) -> int:
                     input_fn=input,
                     runner=_default_runner,
                 )
+                if isinstance(manifest.get("tailscale"), dict):
+                    survived.append(
+                        f"tailscale {manifest['tailscale'].get('mode', 'serve')} route "
+                        f"{manifest['tailscale'].get('path', '')} -> "
+                        f"{manifest['tailscale'].get('target', '')}"
+                    )
             except (OSError, InstallError, subprocess.CalledProcessError):
                 _rollback(
                     previous,
@@ -1151,6 +1259,7 @@ def main(argv: list[str] | None = None) -> int:
                     uv=uv,
                     units=units,
                     runner=_default_runner,
+                    survived=survived,
                 )
                 raise
         checks = run_component_checks(
@@ -1168,9 +1277,14 @@ def main(argv: list[str] | None = None) -> int:
                     uv=uv,
                     units=units,
                     runner=_default_runner,
+                    survived=survived,
                 )
             raise InstallError("one or more required component checks failed")
         if units:
+            # The install stuck, so the displaced units are no longer rollback
+            # material -- and an uncollected backup is how a mistyped password
+            # outlived the install that captured it (#11/#12).
+            discard_unit_backups(units)
             _offer_linger(interactive=interactive, input_fn=input, runner=_default_runner)
 
         print(f"\nInstalled {tool['display_name']} {tool['version']}")

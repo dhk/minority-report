@@ -32,6 +32,7 @@ from deploy.install import (
     _write_units,
     bundle_cleanup_targets,
     cleanup_bundle_artifacts,
+    discard_unit_backups,
     ensure_environment_file,
     ensure_secrets,
     existing_environment_value,
@@ -41,6 +42,7 @@ from deploy.install import (
     prompt_install_root,
     render_service_unit,
     resolve_install_root,
+    restore_units,
 )
 from scripts.pack import (
     PackError,
@@ -1059,10 +1061,115 @@ def test_differing_systemd_unit_is_backed_up_before_replacement(tmp_path: Path) 
     )
 
     backups = list(unit_dir.glob("sample-tool.service.bak-*"))
-    assert units == ["sample-tool.service"]
+    assert [write.unit for write in units] == ["sample-tool.service"]
+    # The displaced content is now carried, not just the unit's name: rollback
+    # cannot put a unit back without it (#12).
+    assert units[0].backup == backups[0]
+    assert units[0].created is False
+    assert units[0].changed is True
     assert len(backups) == 1
     assert backups[0].read_text(encoding="utf-8") == "old unit\n"
     assert unit.read_text(encoding="utf-8") != "old unit\n"
+
+
+def _service_spec() -> dict[str, object]:
+    return {
+        "unit": "sample-tool.service",
+        "description": "Sample Tool",
+        "entrypoint": "sample-tool",
+        "args": ["serve"],
+    }
+
+
+def _write(tmp_path: Path) -> list[installer.UnitWrite]:
+    return _write_units(
+        [_service_spec()],
+        home=tmp_path,
+        current=tmp_path / "src/sample/current",
+        environment_file=tmp_path / ".config/sample/sample.env",
+        secrets_file=tmp_path / ".config/sample/secrets.env",
+    )
+
+
+def test_a_rolled_back_install_puts_the_previous_unit_back(tmp_path: Path) -> None:
+    """#12: rollback reverted the release but left the rewritten unit behind."""
+    unit_dir = tmp_path / ".config" / "systemd" / "user"
+    unit_dir.mkdir(parents=True)
+    unit = unit_dir / "sample-tool.service"
+    unit.write_text("old unit\n", encoding="utf-8")
+
+    writes = _write(tmp_path)
+    assert unit.read_text(encoding="utf-8") != "old unit\n"
+
+    assert restore_units(writes) == []
+
+    assert unit.read_text(encoding="utf-8") == "old unit\n"
+
+
+def test_rollback_removes_a_unit_the_install_created(tmp_path: Path) -> None:
+    writes = _write(tmp_path)
+    unit = tmp_path / ".config" / "systemd" / "user" / "sample-tool.service"
+    assert unit.is_file()
+    assert writes[0].created is True
+
+    assert restore_units(writes) == []
+
+    assert not unit.exists()
+
+
+def test_an_unchanged_unit_is_left_alone_by_a_rollback(tmp_path: Path) -> None:
+    _write(tmp_path)
+    second = _write(tmp_path)
+    unit = tmp_path / ".config" / "systemd" / "user" / "sample-tool.service"
+    content = unit.read_text(encoding="utf-8")
+
+    assert second[0].changed is False
+    assert restore_units([write for write in second if write.changed]) == []
+
+    assert unit.read_text(encoding="utf-8") == content
+
+
+def test_backups_from_this_run_are_discarded_and_older_ones_are_not(tmp_path: Path) -> None:
+    unit_dir = tmp_path / ".config" / "systemd" / "user"
+    unit_dir.mkdir(parents=True)
+    (unit_dir / "sample-tool.service").write_text("old unit\n", encoding="utf-8")
+    stranger = unit_dir / "sample-tool.service.bak-20250101T000000Z-abcdef"
+    stranger.write_text("someone else's install\n", encoding="utf-8")
+
+    writes = _write(tmp_path)
+    assert writes[0].backup is not None and writes[0].backup.is_file()
+
+    discard_unit_backups(writes)
+
+    assert not writes[0].backup.exists()
+    # An earlier run's backup is somebody else's record, and one of them is how
+    # a mistyped password outlived the install that captured it (#11).
+    assert stranger.is_file()
+
+
+def test_a_failed_rollback_names_what_survived(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    installer._report_rollback(
+        ["release symlink"],
+        ["service registry reservations in /var/lib/common-services/registry.json"],
+    )
+
+    err = capsys.readouterr().err
+    assert "Reverted: release symlink." in err
+    assert "NOT reverted" in err
+    assert "service registry reservations" in err
+    assert "back to its previous state" not in err
+
+
+def test_a_clean_rollback_says_the_host_is_unchanged(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    installer._report_rollback(["release symlink", "systemd units"], [])
+
+    err = capsys.readouterr().err
+    assert "The host is back to its previous state." in err
+    assert "NOT reverted" not in err
 
 
 def test_host_environment_update_preserves_unmanaged_lines_and_backs_up(tmp_path: Path) -> None:
