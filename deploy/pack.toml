@@ -53,27 +53,13 @@ static_range = [8700, 8799]
 dynamic_range = [8800, 8999]
 required = true
 
-# Wingman is multi-user: one service on 8789 fronting both '/' and '/shared'.
-# The per-user split (dhk on 8787, trent on 8788 at '/trent') is gone; nothing
-# listens on either port. Declared here only because dhk/wingman has no pack of
-# its own yet, so nothing else would claim 8789 or its paths in the shared
-# registry. It belongs in dhk/wingman — see #21.
-[[registry.entries]]
-service_id = "wingman"
-display_name = "Wingman"
-owner = "dhk"
-protocol = "tcp"
-address = "127.0.0.1"
-port = 8789
-unit = "wingman-mcp.service"
-source = "dhk/wingman"
-adopt_listener = true
-route_mode = "funnel"
-route_host = "tailscale-self"
-route_https_port = 443
-route_paths = ["/", "/shared"]
-route_target = "http://127.0.0.1:8789"
-
+# This pack declares only its own service. Wingman used to be declared here
+# too, because dhk/wingman had no way to declare itself — and this pack, which
+# cannot observe wingman, described two per-user processes on 8787/8788 for
+# weeks after wingman became one process on 8789 (#21). dhk/wingman#289 gave it
+# its own registration, so that entry is gone from here (#23). The registry
+# holds services this pack does not declare; the component check verifies only
+# what is declared and does not require exclusivity.
 [[registry.entries]]
 service_id = "alexandria"
 display_name = "Alexandria"
