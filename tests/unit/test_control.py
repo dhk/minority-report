@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import shutil
 from pathlib import Path
@@ -252,6 +253,88 @@ def test_a_served_corpus_that_is_gone_is_not_reported_as_empty(
 
     assert "Investigations: unknown (that path does not exist)" in lines
     assert not any("Investigations: 0" in line for line in lines)
+
+
+_FUNNEL = {
+    "Web": {
+        "lobster.example.ts.net:443": {
+            "Handlers": {
+                "/": {"Proxy": "http://127.0.0.1:8789"},
+                "/shared": {"Proxy": "http://127.0.0.1:8789"},
+                "/alexandria": {"Proxy": "http://127.0.0.1:8797"},
+            }
+        }
+    }
+}
+
+
+class _Serve:
+    returncode = 0
+
+    def __init__(self, payload: object) -> None:
+        self.stdout = json.dumps(payload)
+
+
+def _with_tailscale(monkeypatch: pytest.MonkeyPatch, payload: object) -> None:
+    monkeypatch.setattr("alexandria.control.shutil.which", lambda _name: "/usr/bin/tailscale")
+
+
+def test_only_paths_pointing_at_our_own_port_are_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _with_tailscale(monkeypatch, _FUNNEL)
+
+    assert control.funnel_paths_for_port(8797, runner=lambda *_a, **_k: _Serve(_FUNNEL)) == [
+        "/alexandria"
+    ]
+    assert control.funnel_paths_for_port(8789, runner=lambda *_a, **_k: _Serve(_FUNNEL)) == [
+        "/",
+        "/shared",
+    ]
+
+
+def test_a_funnel_it_cannot_read_is_reported_as_unknown_not_as_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Silence beats asserting an absence that was never verified."""
+    monkeypatch.setattr("alexandria.control.shutil.which", lambda _name: None)
+    assert control.funnel_paths_for_port(8797) is None
+
+    monkeypatch.setattr("alexandria.control.shutil.which", lambda _name: "/usr/bin/tailscale")
+
+    class _Broken:
+        returncode = 0
+        stdout = "not json"
+
+    assert control.funnel_paths_for_port(8797, runner=lambda *_a, **_k: _Broken()) is None
+
+    def _boom(*_args: object, **_kwargs: object) -> object:
+        raise OSError("tailscaled is not answering")
+
+    assert control.funnel_paths_for_port(8797, runner=_boom) is None
+
+
+def test_advertising_a_path_the_tunnel_forwards_says_nothing() -> None:
+    assert control.funnel_advice("/alexandria", ["/alexandria"]) == []
+
+
+def test_advertising_the_bare_root_while_mounted_under_a_prefix_warns() -> None:
+    """The original #4 failure: '/' reaches whichever service owns that path."""
+    advice = control.funnel_advice("/", ["/alexandria"])
+
+    assert advice
+    assert "does not forward /" in advice[0]
+    assert "/alexandria" in advice[0]
+
+
+def test_a_port_the_tunnel_forwards_nothing_to_warns() -> None:
+    advice = control.funnel_advice("/alexandria", [])
+
+    assert advice and "forwards nothing to this port" in advice[0]
+
+
+def test_an_unreadable_funnel_produces_no_advice() -> None:
+    assert control.funnel_advice("/alexandria", None) == []
 
 
 def test_default_repo_prefers_environment(tmp_path: Path) -> None:

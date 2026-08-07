@@ -15,7 +15,7 @@ import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, TextIO
+from typing import Any, Protocol, TextIO
 
 from alexandria.infrastructure.config import ENV_REPO_ROOT, RepoNotFoundError, load_config
 from alexandria.infrastructure.research_repo import list_investigations
@@ -163,6 +163,85 @@ def service_repo(process: ProcessInfo | None) -> str | None:
         if separator and name == ENV_REPO_ROOT and value:
             return value
     return None
+
+
+def funnel_paths_for_port(
+    port: int,
+    *,
+    runner: Callable[..., Any] = subprocess.run,
+) -> list[str] | None:
+    """Paths the tunnel actually forwards to this port, or None if unknowable.
+
+    Strictly diagnostic: it reads ``tailscale serve status`` and never changes
+    a mount. The funnel is shared with other services, and #4 is explicit that
+    this must not touch it.
+
+    None means "could not tell" — no tailscale, a daemon that will not answer,
+    unparseable output. A tool that cannot see the funnel should say nothing
+    about it rather than assert an absence it did not verify.
+    """
+    if shutil.which("tailscale") is None:
+        return None
+    try:
+        result = runner(
+            ["tailscale", "serve", "status", "--json"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        payload = json.loads(result.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    if getattr(result, "returncode", 1) != 0 or not isinstance(payload, dict):
+        return None
+    web = payload.get("Web")
+    if not isinstance(web, dict):
+        return []
+    target = f"http://127.0.0.1:{port}"
+    paths: list[str] = []
+    for site in web.values():
+        handlers = (site or {}).get("Handlers") if isinstance(site, dict) else None
+        if not isinstance(handlers, dict):
+            continue
+        for path, handler in handlers.items():
+            if isinstance(handler, dict) and handler.get("Proxy") == target:
+                paths.append(str(path))
+    return sorted(set(paths))
+
+
+def funnel_advice(advertised: str, mounted: list[str] | None) -> list[str]:
+    """Say whether the advertised path is one the tunnel actually forwards.
+
+    The failure this exists for: a URL that resolves, reaches the tunnel, and
+    is proxied to a *different service*, which 502s on an MCP request it knows
+    nothing about — while every Alexandria diagnostic reports healthy.
+    """
+    if mounted is None:
+        return []
+    normalized = "/" + advertised.strip("/") if advertised.strip("/") else "/"
+    # '/' is checked like any other path. Exempting it would silence exactly
+    # the case this exists for: advertising the bare root while the funnel
+    # mounts this service under a prefix and gives '/' to someone else.
+    if normalized in mounted:
+        return []
+    if not mounted:
+        return [
+            (
+                f"WARNING: the tunnel forwards nothing to this port, so {normalized} "
+                "is not reachable through it."
+            )
+        ]
+    return [
+        (
+            f"WARNING: the tunnel does not forward {normalized} to this port. "
+            f"It forwards {', '.join(mounted)}."
+        ),
+        (
+            "  A connector on that URL reaches whatever else owns the path, which will "
+            "fail on a request it does not recognise while this server stays healthy."
+        ),
+    ]
 
 
 def _systemd_command(action: str) -> list[str]:
@@ -470,6 +549,11 @@ def _print_urls(
         print(line, file=stream)
     if described:
         print(f"(tunnel path read from the running server, {described})", file=stream)
+    if hosts:
+        # Only worth checking when a tunnel URL was actually printed: without a
+        # front-door host there is no tunnel claim to be wrong about.
+        for line in funnel_advice(_tunnel_path(tunnel_path) or "/", funnel_paths_for_port(port)):
+            print(line, file=stream)
     if not hosts:
         print(
             "(no tunnel hostname detected — is Tailscale up, or is ALEXANDRIA_ALLOWED_HOSTS set?)",
