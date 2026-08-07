@@ -955,6 +955,66 @@ def _print_capability(
         print("  (Tailscale DNS name unavailable; tunnel URL omitted.)")
 
 
+def export_constraints(
+    release: Path,
+    *,
+    uv: str,
+    runner: Callable[..., Any] = subprocess.run,
+) -> Path | None:
+    """Pin the tool install to the versions the lockfile records.
+
+    ``uv tool install`` resolves dependencies fresh and ignores ``uv.lock``,
+    so the deployed service can run versions nobody tested while CI and every
+    local run use the locked ones. Observed as a ``pydantic-settings`` 2.15
+    warning on a host whose lock pins 2.14.2 — harmless in itself, but it is
+    the visible edge of "deployed is not what was tested", which is the same
+    silent divergence this pack keeps being bitten by.
+
+    Returns None when the release ships no lockfile or the export fails: the
+    pack format is project-agnostic, a lock is not guaranteed, and an install
+    that resolves freely is still better than no install.
+    """
+    if not (release / "uv.lock").is_file():
+        return None
+    try:
+        result = runner(
+            [
+                uv,
+                "export",
+                "--frozen",
+                "--no-dev",
+                "--no-emit-project",
+                "--format",
+                "requirements-txt",
+                "--directory",
+                str(release),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if getattr(result, "returncode", 1) != 0 or not (result.stdout or "").strip():
+        return None
+    target = release / ".tool-constraints.txt"
+    try:
+        target.write_text(result.stdout, encoding="utf-8")
+    except OSError:
+        return None
+    return target
+
+
+def tool_install_command(uv: str, release: Path, constraints: Path | None) -> list[str]:
+    """The uv invocation that installs a release, locked where possible."""
+    command = [uv, "tool", "install", "--reinstall"]
+    if constraints is not None:
+        command.extend(["--constraints", str(constraints)])
+    command.append(str(release))
+    return command
+
+
 def _report_rollback(reverted: Sequence[str], survived: Sequence[str]) -> None:
     """Say what came back and what did not.
 
@@ -998,7 +1058,7 @@ def _rollback(
     reverted: list[str] = []
     switch_current(current, previous)
     reverted.append("release symlink")
-    runner([uv, "tool", "install", "--reinstall", str(previous)])
+    runner(tool_install_command(uv, previous, export_constraints(previous, uv=uv)))
     reverted.append("installed commands")
     if changed:
         failures = restore_units(changed)
@@ -1241,7 +1301,13 @@ def main(argv: list[str] | None = None) -> int:
         if manifest.get("source", {}).get("dirty"):
             print("WARNING: this bundle contains uncommitted source changes.")
         uv = ensure_uv(interactive=interactive, input_fn=input, runner=_default_runner)
-        _default_runner([uv, "tool", "install", "--reinstall", str(release)])
+        constraints = export_constraints(release, uv=uv)
+        if constraints is None:
+            print(
+                "  (no lockfile in this release — dependencies resolve freely, so the "
+                "installed versions may differ from the tested ones)"
+            )
+        _default_runner(tool_install_command(uv, release, constraints))
 
         required = install.get("required_secrets", [])
         if not isinstance(required, list) or not all(isinstance(item, str) for item in required):
