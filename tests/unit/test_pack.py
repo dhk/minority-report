@@ -37,6 +37,7 @@ from deploy.install import (
     ensure_secrets,
     environment_preview,
     existing_environment_value,
+    export_constraints,
     install_root_needs_adoption,
     install_support,
     mark_install_root,
@@ -44,6 +45,7 @@ from deploy.install import (
     render_service_unit,
     resolve_install_root,
     restore_units,
+    tool_install_command,
 )
 from scripts.pack import (
     PackError,
@@ -1243,6 +1245,72 @@ def test_a_clean_rollback_says_the_host_is_unchanged(
     err = capsys.readouterr().err
     assert "The host is back to its previous state." in err
     assert "NOT reverted" not in err
+
+
+class _Exported:
+    returncode = 0
+    stdout = "pydantic-settings==2.14.2\npydantic==2.13.4\n"
+
+
+def test_the_tool_install_is_pinned_to_the_lockfiles_versions(tmp_path: Path) -> None:
+    """'uv tool install' ignores uv.lock, so deployed != tested (the 2.15 warning)."""
+    release = tmp_path / "release"
+    release.mkdir()
+    (release / "uv.lock").write_text("# lock\n", encoding="utf-8")
+
+    constraints = export_constraints(release, uv="uv", runner=lambda *_a, **_k: _Exported())
+
+    assert constraints == release / ".tool-constraints.txt"
+    assert "pydantic-settings==2.14.2" in constraints.read_text(encoding="utf-8")
+    command = tool_install_command("uv", release, constraints)
+    assert command == [
+        "uv",
+        "tool",
+        "install",
+        "--reinstall",
+        "--constraints",
+        str(constraints),
+        str(release),
+    ]
+
+
+def test_a_release_without_a_lockfile_still_installs(tmp_path: Path) -> None:
+    """The pack format is project-agnostic; a lock is not guaranteed."""
+    release = tmp_path / "release"
+    release.mkdir()
+
+    assert export_constraints(release, uv="uv", runner=lambda *_a, **_k: _Exported()) is None
+    assert tool_install_command("uv", release, None) == [
+        "uv",
+        "tool",
+        "install",
+        "--reinstall",
+        str(release),
+    ]
+
+
+def test_a_failed_export_does_not_block_the_install(tmp_path: Path) -> None:
+    release = tmp_path / "release"
+    release.mkdir()
+    (release / "uv.lock").write_text("# lock\n", encoding="utf-8")
+
+    class _Failed:
+        returncode = 1
+        stdout = ""
+
+    assert export_constraints(release, uv="uv", runner=lambda *_a, **_k: _Failed()) is None
+    assert not (release / ".tool-constraints.txt").exists()
+
+
+def test_an_export_that_cannot_run_does_not_block_the_install(tmp_path: Path) -> None:
+    release = tmp_path / "release"
+    release.mkdir()
+    (release / "uv.lock").write_text("# lock\n", encoding="utf-8")
+
+    def _boom(*_args: object, **_kwargs: object) -> object:
+        raise OSError("uv is not on PATH")
+
+    assert export_constraints(release, uv="uv", runner=_boom) is None
 
 
 def test_host_environment_update_preserves_unmanaged_lines_and_backs_up(tmp_path: Path) -> None:
