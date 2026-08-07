@@ -151,6 +151,10 @@ def test_url_uses_the_tunnel_path_the_server_is_running_with(
     (repo / "research").mkdir(parents=True)
     monkeypatch.setenv("ALEXANDRIA_REPO", str(repo))
     monkeypatch.setenv("ALEXANDRIA_DATA_DIR", str(tmp_path / "data"))
+    # Supply the front door rather than depending on this machine having a
+    # tailnet name: without it the tunnel line is correctly absent, and the
+    # test would pass on a deployed host and fail in CI.
+    monkeypatch.setenv("ALEXANDRIA_ALLOWED_HOSTS", "lobster.example.ts.net")
     stream = io.StringIO()
 
     control._print_urls(
@@ -163,7 +167,7 @@ def test_url_uses_the_tunnel_path_the_server_is_running_with(
     )
 
     output = stream.getvalue()
-    assert "/alexandria/mcp/" in output
+    assert "https://lobster.example.ts.net/alexandria/mcp/" in output
     assert "tunnel path read from the running server, pid 4242" in output
 
 
@@ -175,6 +179,7 @@ def test_an_explicit_tunnel_path_still_wins_over_the_running_server(
     (repo / "research").mkdir(parents=True)
     monkeypatch.setenv("ALEXANDRIA_REPO", str(repo))
     monkeypatch.setenv("ALEXANDRIA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("ALEXANDRIA_ALLOWED_HOSTS", "lobster.example.ts.net")
     stream = io.StringIO()
 
     control._print_urls(
@@ -187,7 +192,8 @@ def test_an_explicit_tunnel_path_still_wins_over_the_running_server(
     )
 
     output = stream.getvalue()
-    assert "/elsewhere/mcp/" in output
+    assert "https://lobster.example.ts.net/elsewhere/mcp/" in output
+    assert "/alexandria/mcp/" not in output
     assert "read from the running server" not in output
 
 
