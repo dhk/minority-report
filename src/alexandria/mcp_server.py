@@ -73,6 +73,11 @@ def _config_or_message() -> Config | str:
         return str(exc)
 
 
+# Longer than any plausible commission. Past this, a record still marked
+# running is more likely an interrupted server than a slow one (#33).
+_STALE_RUN_SECONDS = 45 * 60
+
+
 @server.tool()
 def status() -> str:
     """Alexandria repository status: investigation counts by lifecycle
@@ -306,6 +311,79 @@ def _draft_review(draft: Draft) -> str:
 
 
 @server.tool()
+def list_runs(limit: int = 20) -> str:
+    """Commissioned runs on this host, newest first: id, status, cost, models.
+
+    Reads the local run store, not the committed corpus. ``status`` and
+    ``list_research`` read ``research/`` and will not show a run until someone
+    deliberately promotes it, so they are not a signal about a run that just
+    finished — or one still going (#33).
+    """
+    config = _config_or_message()
+    if isinstance(config, str):
+        return config
+    try:
+        runs = RunStore(config.data_dir).list_runs()
+    except (CommissionError, OSError, ValueError) as exc:
+        return f"Runs unavailable: {exc}"
+    if not runs:
+        return "No commissioned runs on this host."
+    lines = [f"{len(runs)} run(s), newest first:"]
+    for run in runs[: max(1, limit)]:
+        cost = f"${run.cost_actual:.4f}" if run.cost_actual is not None else "—"
+        lines.append(
+            f"  {run.run_id} · {run.status} · {cost} · "
+            f"{len(run.dispatched_models)} model(s) · started {run.created_at.isoformat()}"
+        )
+    return "\n".join(lines)
+
+
+@server.tool()
+def run_status(run_id: str) -> str:
+    """What happened to one commissioned run, by id.
+
+    Exists so a caller who lost ``run_research``'s reply to a client-side
+    timeout can still find out whether the run happened, what it cost, and
+    which models answered (#33). The work continues on the server regardless of
+    whether anyone is still listening for the reply.
+    """
+    config = _config_or_message()
+    if isinstance(config, str):
+        return config
+    try:
+        run = RunStore(config.data_dir).load_run(run_id.strip())
+    except (CommissionError, OSError, ValueError) as exc:
+        return f"Run unavailable: {exc}"
+    lines = [
+        f"Run: {run.run_id}",
+        f"Status: {run.status}",
+        f"Started: {run.created_at.isoformat()}",
+    ]
+    if run.completed_at is not None:
+        lines.append(f"Completed: {run.completed_at.isoformat()}")
+    if run.status == "running":
+        elapsed = (datetime.now(UTC) - run.created_at).total_seconds()
+        lines.append(f"Elapsed: {elapsed / 60:.1f} min")
+        if elapsed > _STALE_RUN_SECONDS:
+            # A record left "running" long past any plausible commission is
+            # more likely an interrupted server than a slow one. Saying so
+            # beats reporting progress that is not happening.
+            lines.append(
+                "  WARNING: this has been running far longer than a commission takes. "
+                "The server may have been restarted mid-run; this record will not "
+                "update itself."
+            )
+    cost = f"${run.cost_actual:.4f}" if run.cost_actual is not None else "unavailable"
+    lines.append(
+        f"Cost: {cost} (estimate ${run.cost_estimate:.4f})"
+        if run.cost_estimate
+        else f"Cost: {cost}"
+    )
+    lines.append(f"Models dispatched: {', '.join(run.dispatched_models) or 'none'}")
+    return "\n".join(lines)
+
+
+@server.tool()
 async def begin_research(
     task: str,
     pasted_content: str = "",
@@ -383,6 +461,14 @@ async def run_research(draft_id: str, confirmation: str = "") -> str:
     Call this tool only after the operator explicitly approves that review and
     supplies the exact confirmation phrase returned with it. A missing or stale
     phrase leaves the draft untouched and dispatches nothing.
+
+    **This blocks until the whole commission finishes** -- every research model,
+    web search if enabled, and grading. That routinely takes several minutes and
+    will exceed a 60-second MCP client timeout (#33). A timeout here does not
+    mean the run failed: dispatch writes its record before calling any model and
+    the server keeps working whether or not anyone is still listening. Use
+    ``list_runs`` to find the run and ``run_status`` to see how it ended. Do not
+    re-dispatch on a timeout -- that spends the budget twice.
     """
     config = _config_or_message()
     if isinstance(config, str):
@@ -405,7 +491,14 @@ async def run_research(draft_id: str, confirmation: str = "") -> str:
         async with OpenRouterGateway(openrouter_api_key()) as gateway:
             run = await CommissionService(config, gateway).dispatch(draft.draft_id)
     except (CommissionError, OSError, SecretNotFoundError, ValueError) as exc:
-        return f"Run did not start: {exc}"
+        # The run record is written before any model is called, so a failure
+        # here still leaves something findable. Say so rather than implying
+        # nothing happened.
+        return (
+            f"Run did not finish: {exc}\n"
+            "If a run id was allocated, `list_runs` will show it and `run_status` "
+            "will say how far it got."
+        )
     actual_cost = f"${run.cost_actual:.4f}" if run.cost_actual is not None else "unavailable"
     return "\n".join(
         [
