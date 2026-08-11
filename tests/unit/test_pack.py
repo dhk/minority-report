@@ -158,10 +158,24 @@ def test_alexandria_pack_config_is_valid() -> None:
     # This pack declares its own service and nothing else. Wingman declares
     # itself now (dhk/wingman#289); a pack that cannot observe a service has
     # no business describing it (#23).
-    assert [entry.service_id for entry in spec.registry.entries] == ["alexandria"]
-    assert spec.registry.entries[0].port == 8797
-    assert spec.registry.entries[0].route is not None
-    assert spec.registry.entries[0].route.paths == ["/alexandria"]
+    assert [service.unit for service in spec.services] == [
+        "alexandria-mcp.service",
+        "alexandria-web.service",
+    ]
+    # The web surface is supervised too (#39), and its port is inside the
+    # registry's static range so a collision can be refused rather than
+    # discovered.
+    web = spec.services[1]
+    assert web.args == ["--port", "8798"]
+    assert web.health_service == "alexandria-web"
+    assert [entry.service_id for entry in spec.registry.entries] == ["alexandria-web", "alexandria"]
+    assert spec.registry.entries[0].port == 8798
+    # Deliberately no funnel route: no authentication, and POST /dispatch spends.
+    assert spec.registry.entries[0].route is None
+    # The MCP server keeps its funnel route; it is token-guarded, this is not.
+    assert spec.registry.entries[1].port == 8797
+    assert spec.registry.entries[1].route is not None
+    assert spec.registry.entries[1].route.paths == ["/alexandria"]
 
 
 def test_health_checks_reject_another_service_on_the_expected_port(

@@ -32,6 +32,23 @@ args = ["--http", "--port", "8797", "--tunnel-path", "/alexandria"]
 health_url = "http://127.0.0.1:8797/health"
 health_service = "alexandria"
 
+# The web surface, supervised like the MCP server rather than started by hand.
+# It ran under nohup until #39: no restart on crash, dead after logout or a
+# reboot, and silently killed by the very upgrade that replaced its venv.
+#
+# Port 8798 sits inside the registry's static range (8700-8799), so it can be
+# declared and defended from collision. It listened on 8042 before, which is
+# outside the range the registry allocates from and was recorded nowhere.
+#
+# No health check identity problem here: /health names itself (#39).
+[[services]]
+unit = "alexandria-web.service"
+description = "Alexandria web surface (commission and published work)"
+entrypoint = "alexandria-web"
+args = ["--port", "8798"]
+health_url = "http://127.0.0.1:8798/health"
+health_service = "alexandria-web"
+
 [capability]
 token_file = "~/.local/share/alexandria/mcp-http-token"
 urls = [
@@ -60,6 +77,22 @@ required = true
 # its own registration, so that entry is gone from here (#23). The registry
 # holds services this pack does not declare; the component check verifies only
 # what is declared and does not require exclusivity.
+# Declared so nothing else is handed 8798. No route entry: this surface is not
+# on the funnel, deliberately -- it has no authentication and POST /dispatch
+# spends real money.
+[[registry.entries]]
+service_id = "alexandria-web"
+display_name = "Alexandria web"
+owner = "dhk"
+protocol = "tcp"
+address = "127.0.0.1"
+port = 8798
+unit = "alexandria-web.service"
+health_url = "http://127.0.0.1:8798/health"
+health_service = "alexandria-web"
+source = "dhk/minority-report"
+adopt_listener = true
+
 [[registry.entries]]
 service_id = "alexandria"
 display_name = "Alexandria"
