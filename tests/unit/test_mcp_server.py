@@ -1,7 +1,7 @@
 import json
 import re
 import socket
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Self, cast
 
@@ -9,7 +9,14 @@ import pytest
 
 from alexandria import mcp_server
 from alexandria.commission import RunStore
-from alexandria.commission_models import Brief, CallRecord, CostEstimate, Draft, InputArtifact
+from alexandria.commission_models import (
+    Brief,
+    CallRecord,
+    CostEstimate,
+    Draft,
+    InputArtifact,
+    RunRecord,
+)
 from alexandria.infrastructure import config as config_module
 from alexandria.infrastructure.config import ENV_DATA_DIR, ENV_REPO_ROOT, Config, load_config
 from alexandria.input_resolution import extract_input
@@ -475,3 +482,98 @@ def test_draft_review_survives_a_draft_with_no_breakdown() -> None:
     review = _draft_review(draft)
     assert "Estimate: $0.5000" in review
     assert "maximum" not in review
+
+
+def _run_store_with(tmp_path: Path, *records: object) -> Config:
+    config = Config(
+        data_dir=tmp_path / "state",
+        data_dir_source="test",
+        repo_root=tmp_path / "repo",
+        repo_root_source="test",
+    )
+    (tmp_path / "repo" / "research").mkdir(parents=True, exist_ok=True)
+    store = RunStore(config.data_dir)
+    for record in records:
+        store.write_run(record)  # type: ignore[arg-type]
+    return config
+
+
+def _record(run_id: str, status: str, created: datetime, **extra: object) -> RunRecord:
+    return RunRecord(
+        run_id=run_id,
+        brief_revision="A",
+        brief_sha256="abc",
+        status=status,  # type: ignore[arg-type]
+        created_at=created,
+        grading_model="anthropic/claude-sonnet-4.6",
+        inputs=[],
+        dispatched_models=["openai/gpt-5.4"],
+        **extra,  # type: ignore[arg-type]
+    )
+
+
+def test_a_run_lost_to_a_client_timeout_is_still_findable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#33: the reply was the only signal, and losing it lost the run."""
+    config = _run_store_with(
+        tmp_path,
+        _record("r-1", "completed", datetime(2026, 8, 9, 2, tzinfo=UTC), cost_actual=0.37),
+    )
+    monkeypatch.setattr(mcp_server, "_config_or_message", lambda: config)
+
+    listing = mcp_server.list_runs()
+    detail = mcp_server.run_status("r-1")
+
+    assert "r-1" in listing
+    assert "completed" in listing
+    assert "$0.3700" in listing
+    assert "Status: completed" in detail
+    assert "openai/gpt-5.4" in detail
+
+
+def test_a_run_still_running_long_past_plausible_is_flagged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A record left running by a restarted server must not read as progress."""
+    stale = datetime.now(UTC) - timedelta(hours=6)
+    config = _run_store_with(tmp_path, _record("r-stale", "running", stale))
+    monkeypatch.setattr(mcp_server, "_config_or_message", lambda: config)
+
+    detail = mcp_server.run_status("r-stale")
+
+    assert "WARNING" in detail
+    assert "restarted mid-run" in detail
+
+
+def test_a_freshly_running_run_is_not_flagged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _run_store_with(
+        tmp_path, _record("r-new", "running", datetime.now(UTC) - timedelta(minutes=2))
+    )
+    monkeypatch.setattr(mcp_server, "_config_or_message", lambda: config)
+
+    detail = mcp_server.run_status("r-new")
+
+    assert "WARNING" not in detail
+    assert "Elapsed:" in detail
+
+
+def test_an_unknown_run_id_says_so(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _run_store_with(tmp_path)
+    monkeypatch.setattr(mcp_server, "_config_or_message", lambda: config)
+
+    assert "unavailable" in mcp_server.run_status("r-nope")
+    assert "No commissioned runs" in mcp_server.list_runs()
+
+
+def test_run_research_warns_that_a_timeout_is_not_a_failure() -> None:
+    """The docstring is what the model reads before deciding to retry."""
+    # Collapse wrapping: the claim is about what the docstring says, not how it
+    # is laid out.
+    doc = " ".join((mcp_server.run_research.__doc__ or "").split())
+
+    assert "does not mean the run failed" in doc
+    assert "Do not re-dispatch" in doc
+    assert "list_runs" in doc
