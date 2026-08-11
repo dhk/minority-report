@@ -10,7 +10,8 @@ import json
 import os
 import sys
 import zipfile
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, cast
 
@@ -23,6 +24,7 @@ from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Re
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
+from alexandria.background import start as start_dispatch
 from alexandria.commission import (
     DEFAULT_GRADING_MODEL,
     DEFAULT_MODELS,
@@ -340,8 +342,15 @@ def _review_page(draft: Draft) -> str:
 async def dispatch(request: Request) -> Response:
     draft_id = request.path_params["draft_id"]
     try:
-        async with OpenRouterGateway(openrouter_api_key()) as gateway:
-            run = await CommissionService(request.app.state.config, gateway).dispatch(draft_id)
+        # Returns once the run exists; the commission continues in the
+        # background. A browser POST that blocks for minutes is the same bug
+        # as the MCP timeout, and had the same fix (#33).
+        @asynccontextmanager
+        async def _gateway() -> AsyncIterator[Any]:
+            async with OpenRouterGateway(openrouter_api_key()) as gateway:
+                yield gateway
+
+        run = await start_dispatch(request.app.state.config, draft_id, gateway_cm=_gateway)
     except (CommissionError, SecretNotFoundError) as exc:
         return HTMLResponse(
             _layout(f'<h1>Run did not start</h1><p class="warning">{_e(exc)}</p>'), status_code=400
