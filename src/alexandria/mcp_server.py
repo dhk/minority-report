@@ -57,6 +57,8 @@ from alexandria.input_resolution import (
     pasted_input,
     validate_input_set,
 )
+from alexandria.publish import PublishError
+from alexandria.publish import publish_run as publish_run_to_corpus
 from alexandria.resolution import RESOLUTION_FILENAME, ResolutionError
 from alexandria.resolution import draft_resolution as draft_resolution_model
 from alexandria.version import service_version
@@ -381,6 +383,28 @@ def run_status(run_id: str) -> str:
     )
     lines.append(f"Models dispatched: {', '.join(run.dispatched_models) or 'none'}")
     return "\n".join(lines)
+
+
+@server.tool()
+def publish_run(run_id: str, slug: str, title: str = "", overwrite: bool = False) -> str:
+    """Draft a finished run into the research corpus as investigation ``slug``.
+
+    Writes into the corpus working tree and stops. It does not commit and does
+    not push: the corpus is authoritative because a human puts things there
+    (AGENTS.md rule 7). Read the diff, then commit it yourself.
+
+    Raw provider responses are not published -- the corpus is public. The
+    manifest records that they exist, with hashes, so the omission is visible.
+    Extracted quotes in scores.csv do publish.
+    """
+    config = _config_or_message()
+    if isinstance(config, str):
+        return config
+    try:
+        result = publish_run_to_corpus(config, run_id, slug, title=title, overwrite=overwrite)
+    except (CommissionError, PublishError, OSError, ValueError) as exc:
+        return f"Nothing was published: {exc}"
+    return result.summary()
 
 
 @server.tool()
