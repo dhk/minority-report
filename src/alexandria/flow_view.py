@@ -39,6 +39,8 @@ body.flow-body{margin:0;background:var(--bg);color:var(--text);font-family:syste
   padding:20px 32px;border-bottom:1px solid var(--border)}
 .flow-idea-line{display:flex;flex-direction:column;gap:4px;max-width:70ch}
 .flow-idea-line h1{font-size:22px;line-height:1.3;letter-spacing:-.01em;margin:0}
+.flow-back{color:var(--accent,#2b50e8);text-decoration:none}
+.flow-back:hover{text-decoration:underline}
 .flow-meta{font-family:var(--font-mono,monospace);font-size:11.5px;letter-spacing:.06em;
   text-transform:uppercase;color:var(--text-dim)}
 .flow-export{display:flex;flex-direction:column;align-items:flex-end;gap:4px;position:relative}
@@ -433,6 +435,7 @@ def render_flow_page(document_json: dict[str, Any]) -> str:
     body = f"""
 <header class="flow-header">
   <div class="flow-idea-line">
+    <div class="flow-meta"><a href="/" class="flow-back">&larr; Published work</a></div>
     <div class="flow-meta">{_e(document_json["idea_slug"])}</div>
     <h1>{_e(title)}</h1>
     <div class="flow-meta">{" &middot; ".join(_e(b) for b in meta_bits)}</div>

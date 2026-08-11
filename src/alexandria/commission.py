@@ -32,10 +32,15 @@ from alexandria.commission_models import (
 from alexandria.infrastructure.config import Config
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+# Four distinct training lineages, deliberately. This product exists to surface
+# disagreement, and models from one family agree with each other for reasons
+# that are not evidence. grok-4.5 replaced google/gemini-3.1-pro-preview: the
+# Google entry was a preview build, and swapping it for another Google model
+# would have kept the panel at three families.
 DEFAULT_MODELS = [
     "openai/gpt-5.4",
     "anthropic/claude-opus-4.7",
-    "google/gemini-3.1-pro-preview",
+    "x-ai/grok-4.5",
 ]
 DEFAULT_GRADING_MODEL = "anthropic/claude-sonnet-4.6"
 

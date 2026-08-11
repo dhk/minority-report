@@ -103,7 +103,30 @@ def _e(value: object) -> str:
     return html.escape(str(value), quote=True)
 
 
-def _layout(body: str, *, title: str = "Alexandria") -> str:
+ACTIVE_STATUSES = ("draft", "running")
+
+TABS = (
+    ("/", "Published work"),
+    ("/commission", "New commission"),
+    ("/active", "What's active"),
+)
+
+
+def _tabstrip(current: str) -> str:
+    """The three top-level surfaces, as links rather than client-side state.
+
+    Links so a tab can be shared and bookmarked, and so this matches how the
+    per-run sub-view tabs already work rather than introducing a second
+    navigation idiom.
+    """
+    items = "".join(
+        f'<a class="tab{" active" if href == current else ""}" href="{href}">{_e(label)}</a>'
+        for href, label in TABS
+    )
+    return f'<nav class="tabs">{items}</nav>'
+
+
+def _layout(body: str, *, title: str = "Alexandria", tab: str | None = None) -> str:
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
 <title>{_e(title)}</title>
@@ -119,7 +142,7 @@ body{{background:var(--bg);color:var(--text);font-family:system-ui;margin:0}} he
 .heatmap-intro{{max-width:72ch;color:var(--text-muted);line-height:1.65;margin:24px 0 30px}} .claim-document{{display:grid;gap:16px}} .claim-block{{border:1px solid var(--border);border-left:5px solid var(--text-dim);border-radius:4px;padding:20px;background:var(--bg2)}} .claim-block.group-consensus{{border-left-color:var(--accent);background:rgba(43,80,232,.06)}} .claim-block.group-disagreement{{border-left-color:var(--accent-orange);background:rgba(224,92,42,.07)}} .claim-block.group-novel{{border-left-color:var(--accent-purple);background:rgba(122,75,190,.07)}} .claim-block.group-thin{{border-left-color:var(--accent-teal);background:rgba(31,139,134,.07)}} .claim-block.group-silent{{border-left-color:var(--text-dim)}} .claim-block h2{{font-size:19px;line-height:1.45;margin:8px 0 18px}} .claim-models{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}} .claim-model{{border:1px solid var(--border);background:var(--bg);padding:10px;border-radius:4px}} .claim-model .score{{display:inline-block;min-width:28px;padding:4px 7px;margin-right:8px}} .claim-model-name{{font-family:var(--font-mono);font-size:11px;color:var(--text-dim);overflow-wrap:anywhere}} .claim-evidence{{font-size:13px;line-height:1.5;color:var(--text-muted);margin:8px 0 0}}
 .raw-list,.provenance-layout{{margin-top:30px}} .raw-call{{border-bottom:1px solid var(--border);padding:16px 0}} .raw-call summary{{display:grid;grid-template-columns:minmax(180px,240px) 1fr auto;gap:20px;align-items:baseline;cursor:pointer}} .raw-call-name{{display:flex;flex-direction:column;gap:3px}} .raw-meta{{font-family:var(--font-mono);font-size:11.5px;color:var(--text-dim)}} .provenance-layout{{display:grid;grid-template-columns:1fr 1fr;gap:48px;align-items:start}} .section-rule{{display:flex;align-items:center;gap:20px;padding-bottom:16px}} .section-rule span:last-child{{flex:1;height:1px;background:var(--border)}} .manifest-row{{display:grid;grid-template-columns:190px 1fr;gap:16px;padding:9px 0;border-bottom:1px solid var(--border)}} .manifest-row dd,.manifest-row dt{{margin:0}} .manifest-row dd{{font-family:var(--font-mono);font-size:12px;color:var(--text-muted);word-break:break-word}} .limitation{{border-left:2px solid var(--border);padding:4px 0 4px 12px;margin-bottom:16px;font-size:14.5px;line-height:1.6}} .empty-state{{border-left:2px solid var(--border);padding-left:14px;color:var(--text-muted)}}
 @media(max-width:900px){{.grid,.report-layout,.provenance-layout{{grid-template-columns:1fr}} .stats{{grid-template-columns:repeat(2,auto)}} .artifact-card{{position:static}} .raw-call summary{{grid-template-columns:1fr}}}} @media(max-width:600px){{main{{padding:28px 18px 100px}} .tabs{{gap:16px;overflow-x:auto}}}}
-</style></head><body><header><div><strong>Alexandria</strong> <span class="mono">Research commissions</span></div><nav><a href="/">History / New commission</a></nav></header><main>{body}</main></body></html>"""
+</style></head><body><header><div><strong>Alexandria</strong> <span class="mono">Research commissions</span></div><nav><a href="/">Published work</a></nav></header><main>{_tabstrip(tab) if tab else ""}{body}</main></body></html>"""
 
 
 def _input_rows(inputs: Sequence[InputArtifact]) -> str:
@@ -153,10 +176,16 @@ def _investigations(config: Config) -> str:
     )
 
 
-def _history(store: RunStore) -> str:
-    runs = store.list_runs()
+def _history(store: RunStore, *, statuses: tuple[str, ...] | None = None, empty: str = "") -> str:
+    """Run rows, optionally narrowed to some statuses.
+
+    "What's active" is a filter over the same history rather than a second
+    notion of state: RunStatus already distinguishes draft/running from the
+    finished ones.
+    """
+    runs = [run for run in store.list_runs() if statuses is None or run.status in statuses]
     if not runs:
-        return "<p>No commissioned runs yet.</p>"
+        return f"<p>{empty or 'No commissioned runs yet.'}</p>"
     rows = "".join(
         f'<tr><td><a href="/runs/{_e(run.run_id)}">{_e(run.run_id)}</a></td>'
         f"<td>{_e(run.status)}</td><td>{len(run.inputs)}</td><td>{len(run.dispatched_models)}</td>"
@@ -166,13 +195,8 @@ def _history(store: RunStore) -> str:
     return f"<table><thead><tr><th>Run</th><th>Status</th><th>Inputs</th><th>Models</th><th>Cost</th></tr></thead><tbody>{rows}</tbody></table>"
 
 
-async def homepage(request: Request) -> HTMLResponse:
-    config: Config = request.app.state.config
-    models = "\n".join(DEFAULT_MODELS)
-    body = f"""
-<h1>Commission the same question to several models.</h1>
-<p>Keep what each one said. Agreement is model agreement. It is not verification.</p>
-<section class="card"><form action="/review" method="post" enctype="multipart/form-data">
+def _commission_form(models: str) -> str:
+    return f"""<section class="card"><form action="/review" method="post" enctype="multipart/form-data">
 <div class="grid"><div><h2>Inputs</h2>
 <label>Paste content<textarea name="pasted_content" placeholder="Paste source material verbatim"></textarea></label>
 <label>GitHub URL<input name="repository_url" type="url" placeholder="Repo, issue, PR, or blob URL"></label>
@@ -184,11 +208,46 @@ async def homepage(request: Request) -> HTMLResponse:
 <label>Research models<textarea name="models">{_e(models)}</textarea></label>
 <label>Grading model<input name="grading_model" value="{_e(DEFAULT_GRADING_MODEL)}"></label>
 <label>Hard ceiling (USD)<input name="ceiling_usd" type="number" min="0.01" step="0.01" value="1.00"></label>
-<button type="submit">Review commission →</button></div></div></form></section>
-<h2>Research investigations</h2>{_investigations(config)}
-<h2>Run history</h2>{_history(RunStore(config.data_dir))}
+<button type="submit">Review commission →</button></div></div></form></section>"""
+
+
+async def homepage(request: Request) -> HTMLResponse:
+    """Published work: what exists beats what you might make, so this lands."""
+    config: Config = request.app.state.config
+    body = f"""
+<h1>Published work</h1>
+<p>Every investigation in the research corpus, and how far each one has come.</p>
+{_investigations(config)}
 """
-    return HTMLResponse(_layout(body))
+    return HTMLResponse(_layout(body, tab="/"))
+
+
+async def commission(request: Request) -> HTMLResponse:
+    models = "\n".join(DEFAULT_MODELS)
+    body = f"""
+<h1>Commission the same question to several models.</h1>
+<p>Keep what each one said. Agreement is model agreement. It is not verification.</p>
+{_commission_form(models)}
+"""
+    return HTMLResponse(_layout(body, title="New commission · Alexandria", tab="/commission"))
+
+
+async def active(request: Request) -> HTMLResponse:
+    """Runs not yet finished, and every finished one beneath them.
+
+    Completed runs stay reachable here: "what's active" is not "everything",
+    and history with nowhere to live is history nobody finds.
+    """
+    config: Config = request.app.state.config
+    store = RunStore(config.data_dir)
+    body = f"""
+<h1>What's active</h1>
+<p>Commissions still drafting or running. A run leaves this list when it finishes.</p>
+{_history(store, statuses=ACTIVE_STATUSES, empty="Nothing is running or drafting right now.")}
+<h2>Finished runs</h2>
+{_history(store, statuses=("completed", "partial", "failed"), empty="No finished runs yet.")}
+"""
+    return HTMLResponse(_layout(body, title="What's active · Alexandria", tab="/active"))
 
 
 async def _uploaded_inputs(form: Any) -> list[InputArtifact]:
@@ -684,8 +743,22 @@ async def heatmap_html(request: Request) -> Response:
         claims, scores = _load_result(config, run)
     except (CommissionError, OSError, ValueError) as exc:
         return Response(f"Heatmap unavailable: {exc}\n", status_code=404, media_type="text/plain")
+    # The bundled copy of this document has to work as a file with no server,
+    # so _standalone_heatmap stays standalone. The way back is added to the
+    # served response only (#35).
+    document = _standalone_heatmap(run, claims, scores)
+    banner = (
+        f'<p style="font:13px system-ui;padding:14px 20px;margin:0;'
+        f'border-bottom:1px solid #ccc">'
+        f'<a href="/runs/{_e(run.run_id)}">&larr; Back to run {_e(run.run_id)}</a></p>'
+    )
+    served = (
+        document.replace("<body>", f"<body>{banner}", 1)
+        if "<body>" in document
+        else banner + document
+    )
     return Response(
-        _standalone_heatmap(run, claims, scores),
+        served,
         media_type="text/html",
         headers={"Content-Disposition": f'inline; filename="{run.run_id}-heatmap.html"'},
     )
@@ -810,6 +883,8 @@ def create_app(config: Config | None = None) -> Starlette:
     config = config or load_config()
     routes: list[Any] = [
         Route("/", homepage),
+        Route("/commission", commission),
+        Route("/active", active),
         Route("/review", review, methods=["POST"]),
         Route("/dispatch/{draft_id}", dispatch, methods=["POST"]),
         Route("/runs/{run_id}", result),
