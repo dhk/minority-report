@@ -110,6 +110,10 @@ class ScoreRecord(BaseModel):
     score: int | None
     quote: str | None
     grading_call_id: str | None
+    # None means "never checked" — runs written before #47 existed. False means
+    # checked and not found in the response it claims to quote. Distinguishing
+    # the two matters: assuming an unchecked quote is good is the defect.
+    quote_verified: bool | None = None
 
 
 class ClaimRecord(BaseModel):
@@ -117,6 +121,11 @@ class ClaimRecord(BaseModel):
     text: str
     group: ClaimGroup
     responding_model_count: int
+    # The span of the brief this claim was drawn from, verified to occur there
+    # (#37). None means the grader gave none, or gave one that did not check
+    # out, or the run predates the field — in every case the claim is not
+    # anchored, and a reader must be told so rather than shown a guess.
+    brief_quote: str | None = None
 
 
 class RunRecord(BaseModel):

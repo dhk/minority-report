@@ -12,6 +12,8 @@ from alexandria.commission import (
     CommissionError,
     CommissionService,
     OpenRouterGateway,
+    _claims_and_scores,
+    _grading_prompt,
     classify_scores,
 )
 from alexandria.commission_models import Brief, CallRecord
@@ -444,3 +446,109 @@ async def test_cost_json_is_listed_as_a_run_artifact(tmp_path: Path) -> None:
         (service.store.run_dir(run.run_id) / "manifest.json").read_text(encoding="utf-8")
     )
     assert "cost.json" in manifest["artifacts"]
+
+
+def test_a_fabricated_quote_is_recorded_as_unverified_not_accepted() -> None:
+    """#47: the evidence column was asserted, never established."""
+    payload = {
+        "claims": [
+            {
+                "text": "The port should stay narrow.",
+                "scores": [{"model_index": 1, "score": 3, "quote": "a span nobody ever wrote"}],
+            }
+        ]
+    }
+    calls = [
+        CallRecord(
+            model_id="alpha/model",
+            status="success",
+            body="Evidence says the provider port should remain narrow.",
+            raw_response="{}",
+            latency_ms=10,
+        )
+    ]
+
+    _claims, scores = _claims_and_scores(payload, calls, "gen-1", "the brief")
+
+    assert scores[0].quote == "a span nobody ever wrote", "recorded, not dropped"
+    assert scores[0].quote_verified is False
+
+
+def test_a_reflowed_quote_still_verifies() -> None:
+    """Rewrapping a line is still quoting; only invention is not."""
+    payload = {
+        "claims": [
+            {
+                "text": "The port should stay narrow.",
+                "scores": [
+                    {"model_index": 1, "score": 3, "quote": "provider port\n  should   remain"}
+                ],
+            }
+        ]
+    }
+    calls = [
+        CallRecord(
+            model_id="alpha/model",
+            status="success",
+            body="Evidence says the provider port should remain narrow.",
+            raw_response="{}",
+            latency_ms=10,
+        )
+    ]
+
+    _claims, scores = _claims_and_scores(payload, calls, "gen-1", "the brief")
+
+    assert scores[0].quote_verified is True
+
+
+def test_a_brief_anchor_is_kept_only_when_it_occurs_in_the_brief() -> None:
+    """#37: an anchor the grader invented is worse than no anchor."""
+    brief = "Assess whether the provider port should remain narrow."
+    calls = [
+        CallRecord(
+            model_id="alpha/model",
+            status="success",
+            body="narrow",
+            raw_response="{}",
+            latency_ms=10,
+        )
+    ]
+    good = {
+        "claims": [
+            {
+                "text": "A claim.",
+                "brief_quote": "whether the provider port should remain narrow",
+                "scores": [{"model_index": 1, "score": 0, "quote": ""}],
+            }
+        ]
+    }
+    invented = {
+        "claims": [
+            {
+                "text": "A claim.",
+                "brief_quote": "a line the brief never contained",
+                "scores": [{"model_index": 1, "score": 0, "quote": ""}],
+            }
+        ]
+    }
+
+    kept, _ = _claims_and_scores(good, calls, "gen-1", brief)
+    discarded, _ = _claims_and_scores(invented, calls, "gen-1", brief)
+
+    assert kept[0].brief_quote == "whether the provider port should remain narrow"
+    assert discarded[0].brief_quote is None
+
+
+def test_the_grader_is_shown_the_brief() -> None:
+    """It could not anchor a claim to a question it never saw (#37)."""
+    calls = [
+        CallRecord(
+            model_id="alpha/model", status="success", body="x", raw_response="{}", latency_ms=10
+        )
+    ]
+
+    prompt = _grading_prompt(calls, ["alpha/model"], "Assess the provider port.")
+
+    assert "Assess the provider port." in prompt
+    assert "brief_quote" in prompt
+    assert "checked against the brief" in prompt

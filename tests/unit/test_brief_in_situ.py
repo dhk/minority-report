@@ -125,3 +125,40 @@ def test_a_long_paragraph_does_not_become_a_magnet() -> None:
 
     assert len(result.paragraphs[1].claims) == 1, "the short, on-topic paragraph should win"
     assert result.paragraphs[0].claims == []
+
+
+def test_a_verified_span_places_a_claim_rather_than_word_overlap() -> None:
+    """Provenance beats resemblance: a recorded anchor is not a guess."""
+    claim = _claim("Something with no words in common with its own paragraph.")
+    claim["brief_quote"] = "anything about the mobile client"
+
+    result = attribute(BRIEF, [claim])
+
+    assert result.recorded == 1
+    assert len(result.paragraphs[2].claims) == 1, "placed by the span, not by overlap"
+
+
+def test_an_anchor_that_is_not_in_the_brief_falls_back_to_inference() -> None:
+    """A discarded anchor must not silently become a confident placement."""
+    claim = _claim("The provider port should remain narrow.")
+    claim["brief_quote"] = "a sentence the brief never contained"
+
+    result = attribute(BRIEF, [claim])
+
+    assert result.recorded == 0
+    assert result.anchored_count == 1, "still placed, but by inference"
+
+
+def test_the_document_distinguishes_recorded_from_inferred() -> None:
+    class _Run:
+        run_id = "r"
+
+    recorded = _claim("Anything at all.")
+    recorded["brief_quote"] = "anything about the mobile client"
+    mixed = render(_Run(), BRIEF, [recorded, _claim("The provider port should remain narrow.")])
+    inferred_only = render(_Run(), BRIEF, [_claim("The provider port should remain narrow.")])
+    recorded_only = render(_Run(), BRIEF, [recorded])
+
+    assert "Mixed provenance" in mixed
+    assert "inferred, not recorded" in inferred_only
+    assert "recorded, not inferred" in recorded_only

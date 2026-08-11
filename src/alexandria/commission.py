@@ -374,7 +374,15 @@ def _research_prompt(brief: Brief, inputs: list[InputArtifact]) -> str:
     return "\n\n".join(sections)
 
 
-def _grading_prompt(calls: list[CallRecord], responding_models: list[str]) -> str:
+def _grading_prompt(
+    calls: list[CallRecord], responding_models: list[str], brief_text: str = ""
+) -> str:
+    """The grader sees the brief now, so it can say where a claim came from.
+
+    It previously saw only the model outputs, which is why claims carried no
+    anchor back to the question (#37). The brief costs tokens on every run; the
+    alternative is inferring provenance after the fact, which is a guess.
+    """
     anonymized = []
     for index, model in enumerate(responding_models):
         call = next(call for call in calls if call.model_id == model)
@@ -383,12 +391,21 @@ def _grading_prompt(calls: list[CallRecord], responding_models: list[str]) -> st
         [
             (
                 "Blindly compare these independent research outputs. Return JSON only with this shape: "
-                '{"claims":[{"text":"one declarative proposition","scores":'
-                '[{"model_index":1,"score":-3,"quote":"verbatim span"}]}],'
+                '{"claims":[{"text":"one declarative proposition",'
+                '"brief_quote":"verbatim span from the brief this claim answers, or empty",'
+                '"scores":[{"model_index":1,"score":-3,"quote":"verbatim span"}]}],'
                 '"report_markdown":"report with a What this run does not establish section"}. '
                 "Scores are integers -3..3; 0 means no bearing statement and must have an empty quote. "
                 "Every non-zero score must quote an exact verbatim span. Include the union of material claims. "
+                "brief_quote must be copied exactly from the brief below; leave it empty rather "
+                "than paraphrasing or inventing one, because it is checked against the brief and "
+                "discarded if it does not appear there. "
                 "Do not identify or rank the model authors."
+            ),
+            *(
+                ["BRIEF — THE QUESTION THAT WAS ASKED\n---\n" + brief_text + "\n---"]
+                if brief_text
+                else []
             ),
             *anonymized,
         ]
@@ -405,14 +422,34 @@ def _parse_json_object(text: str) -> dict[str, Any]:
     return parsed
 
 
+def _normalise_for_quoting(text: str) -> str:
+    """Collapse whitespace and case so reflow is tolerated but invention is not.
+
+    A model that rewraps a line is still quoting; a model that writes a sentence
+    the source never contained is not. This is the only latitude given.
+    """
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def quote_occurs_in(quote: str, source: str) -> bool:
+    """Whether a quoted span genuinely appears in the text it is attributed to."""
+    if not quote.strip():
+        return False
+    return _normalise_for_quoting(quote) in _normalise_for_quoting(source)
+
+
 def _claims_and_scores(
-    payload: dict[str, Any], calls: list[CallRecord], grading_call_id: str | None
+    payload: dict[str, Any],
+    calls: list[CallRecord],
+    grading_call_id: str | None,
+    brief_text: str = "",
 ) -> tuple[list[ClaimRecord], list[ScoreRecord]]:
     responding = [call.model_id for call in calls if call.status == "success"]
     failed = [call.model_id for call in calls if call.status == "failed"]
     raw_claims = payload.get("claims")
     if not isinstance(raw_claims, list):
         raise TypeError("analysis response has no claims list")
+    bodies = {call.model_id: call.body or "" for call in calls}
     claims: list[ClaimRecord] = []
     scores: list[ScoreRecord] = []
     for claim_index, raw_claim in enumerate(raw_claims, start=1):
@@ -442,6 +479,10 @@ def _claims_and_scores(
                 raise ValueError(f"non-zero score has no quote for {claim_id}/{model_id}")
             if score == 0:
                 quote = None
+            # Checked, not trusted (#47). A mismatch is recorded rather than
+            # dropped: a removed quote leaves a score that looks unevidenced,
+            # when what actually happened is that its evidence did not hold up.
+            verified = quote_occurs_in(quote, bodies.get(model_id, "")) if quote else None
             numeric_scores.append(score)
             scores.append(
                 ScoreRecord(
@@ -450,6 +491,7 @@ def _claims_and_scores(
                     score=score,
                     quote=quote,
                     grading_call_id=grading_call_id,
+                    quote_verified=verified,
                 )
             )
         scores.extend(
@@ -462,12 +504,17 @@ def _claims_and_scores(
             )
             for model_id in failed
         )
+        # An anchor the grader invented is worse than no anchor, so a span
+        # that is not in the brief is discarded rather than shown (#37).
+        raw_anchor = str(raw_claim.get("brief_quote") or "").strip()
+        anchor_span = raw_anchor if raw_anchor and quote_occurs_in(raw_anchor, brief_text) else None
         claims.append(
             ClaimRecord(
                 claim_id=claim_id,
                 text=str(raw_claim["text"]).strip(),
                 group=classify_scores(numeric_scores, len(responding)),
                 responding_model_count=len(responding),
+                brief_quote=anchor_span,
             )
         )
     return claims, scores
@@ -606,7 +653,9 @@ class CommissionService:
         if successful:
             grading_call = await self.gateway.complete(
                 draft.grading_model,
-                _grading_prompt(calls, [call.model_id for call in successful]),
+                _grading_prompt(
+                    calls, [call.model_id for call in successful], draft.brief.verbatim()
+                ),
             )
             _write_atomic(
                 run_dir / "raw" / "grading.json",
@@ -615,7 +664,25 @@ class CommissionService:
             if grading_call.status == "success" and grading_call.body:
                 try:
                     analysis = _parse_json_object(grading_call.body)
-                    claims, scores = _claims_and_scores(analysis, calls, grading_call.generation_id)
+                    claims, scores = _claims_and_scores(
+                        analysis, calls, grading_call.generation_id, draft.brief.verbatim()
+                    )
+                    unverified = sum(1 for score in scores if score.quote_verified is False)
+                    if unverified:
+                        limitations.append(
+                            f"{unverified} quoted span(s) were not found in the response they were "
+                            "attributed to. They are recorded and marked unverified, not removed — "
+                            "a missing quote would read as a score with no evidence rather than "
+                            "one whose evidence did not check out."
+                        )
+                    unanchored = sum(1 for claim in claims if claim.brief_quote is None)
+                    if claims and unanchored:
+                        limitations.append(
+                            f"{unanchored} of {len(claims)} claim(s) carry no verified span back to "
+                            "the brief, so the brief-in-situ view falls back to inferring where they "
+                            "came from for those."
+                        )
+
                     report = str(analysis.get("report_markdown") or report)
                 except (ValueError, TypeError, KeyError) as exc:
                     limitations.append(f"Grading output could not be validated: {exc}")
@@ -630,7 +697,16 @@ class CommissionService:
         csv_buffer = io.StringIO()
         writer = csv.DictWriter(
             csv_buffer,
-            fieldnames=["claim_id", "model_id", "score", "quote", "grading_call_id"],
+            fieldnames=[
+                "claim_id",
+                "model_id",
+                "score",
+                "quote",
+                "grading_call_id",
+                # Whether that quote was found in the response it names (#47).
+                # Published: a reader of the corpus can see which evidence held up.
+                "quote_verified",
+            ],
         )
         writer.writeheader()
         for score in scores:

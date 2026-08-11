@@ -132,6 +132,8 @@ class AnchoredParagraph:
 class Attribution:
     paragraphs: list[AnchoredParagraph]
     unanchored: list[dict[str, Any]]
+    #: Claims placed by a verified span from the grader, not by inference.
+    recorded: int = 0
 
     @property
     def anchored_count(self) -> int:
@@ -152,7 +154,23 @@ def attribute(brief_text: str, claims: list[dict[str, Any]]) -> Attribution:
     sizes = [max(sum(profile.values()), 1) for profile in profiles]
 
     unanchored: list[dict[str, Any]] = []
+    recorded = 0
     for claim in claims:
+        # A span the grader returned and the pipeline verified against the brief
+        # (#37) beats any inference — this is provenance, not resemblance.
+        anchor = str(claim.get("brief_quote") or "").strip()
+        if anchor:
+            normalised = re.sub(r"\s+", " ", anchor).lower()
+            placed = False
+            for index, block in enumerate(blocks):
+                if normalised in re.sub(r"\s+", " ", block).lower():
+                    paragraphs[index].claims.append(claim)
+                    recorded += 1
+                    placed = True
+                    break
+            if placed:
+                continue
+
         claim_words = _content_words(str(claim.get("text", "")))
         best_index, best_score = -1, 0.0
         for index, profile in enumerate(profiles):
@@ -166,7 +184,7 @@ def attribute(brief_text: str, claims: list[dict[str, Any]]) -> Attribution:
             paragraphs[best_index].claims.append(claim)
         else:
             unanchored.append(claim)
-    return Attribution(paragraphs=paragraphs, unanchored=unanchored)
+    return Attribution(paragraphs=paragraphs, unanchored=unanchored, recorded=recorded)
 
 
 def _claim_chip(claim: dict[str, Any]) -> str:
@@ -218,6 +236,31 @@ def render(run: Any, brief_text: str, claims: list[dict[str, Any]]) -> str:
 
     traced = attribution.anchored_count
     total = traced + len(attribution.unanchored)
+    inferred = traced - attribution.recorded
+    if attribution.recorded and not inferred:
+        caveat = (
+            "<strong>Every placement here was recorded, not inferred.</strong> Each claim "
+            "carries a span the grader copied from the brief, checked to occur there before "
+            "it was kept. Colour still shows only what the models agreed or disagreed about: "
+            "agreement is model agreement, not verification."
+        )
+    elif attribution.recorded:
+        caveat = (
+            f"<strong>Mixed provenance: {attribution.recorded} placement(s) recorded, "
+            f"{inferred} inferred.</strong> Recorded ones carry a span the grader copied "
+            "from the brief and the pipeline verified. Inferred ones were matched to the "
+            "paragraph they share the most content words with — a guess, at paragraph "
+            "resolution. Agreement is model agreement, not verification."
+        )
+    else:
+        caveat = (
+            "<strong>Attribution here is inferred, not recorded.</strong> These claims carry "
+            "no verified span back to the text that produced them, so each is matched to the "
+            "paragraph it shares the most content words with. That is a guess about "
+            "provenance, at paragraph resolution. Colour shows which passages provoked "
+            "agreement or disagreement — it does not show that a model was reading that "
+            "passage. Agreement is model agreement, not verification."
+        )
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
 <title>Brief in situ — {escape(str(getattr(run, "run_id", "")))}</title>
@@ -255,12 +298,7 @@ h1{{font:600 26px/1.3 ui-sans-serif,system-ui;margin:0 0 6px}}
 <h1>The brief, in situ</h1>
 <p class="meta">Run {escape(str(getattr(run, "run_id", "")))} &middot;
 {traced} of {total} claims traced to a passage</p>
-<p class="caveat"><strong>Attribution here is inferred, not recorded.</strong>
-Claims carry no reference back to the text that produced them, so each one is
-matched to the paragraph it shares the most content words with. That is a guess
-about provenance, at paragraph resolution. Colour shows which passages provoked
-agreement or disagreement — it does not show that a model was reading that
-passage. Agreement is model agreement, not verification.</p>
+<p class="caveat">{caveat}</p>
 {"".join(body)}
 </main></body></html>
 """
