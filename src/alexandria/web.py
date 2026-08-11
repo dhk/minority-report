@@ -35,6 +35,7 @@ from alexandria.commission import (
     RunStore,
 )
 from alexandria.commission_models import Brief, Draft, InputArtifact, RunRecord
+from alexandria.dashboard import survey
 from alexandria.flow import build_flow_document, flow_document_json
 from alexandria.flow_view import render_flow_page
 from alexandria.infrastructure.config import (
@@ -114,6 +115,7 @@ TABS = (
     ("/", "Published work"),
     ("/commission", "New commission"),
     ("/active", "What's active"),
+    ("/dashboard", "Dashboard"),
 )
 
 
@@ -144,7 +146,7 @@ body{{background:var(--bg);color:var(--text);font-family:system-ui;margin:0}} he
 .result-header{{display:flex;align-items:flex-start;justify-content:space-between;gap:40px;flex-wrap:wrap}} .result-copy{{max-width:62ch}} .result-copy h1{{font-size:34px;line-height:1.15;letter-spacing:-.02em;margin:10px 0 12px}} .result-copy p{{font-size:15.5px;line-height:1.6;color:var(--text-muted);margin:0}} .stats{{display:grid;grid-template-columns:repeat(4,auto);gap:28px}} .stat{{display:flex;flex-direction:column;gap:4px}} .stat strong{{font-size:26px;letter-spacing:-.02em}} .stat span{{color:var(--text-dim)}} .stat.consensus strong{{color:var(--accent)}} .stat.disagreement strong{{color:var(--accent-orange)}} .stat.novel strong{{color:var(--accent-purple)}}
 .failure-banner{{border-left:2px solid var(--accent-orange);padding:6px 0 6px 14px;margin-top:26px;display:flex;gap:18px;align-items:baseline;flex-wrap:wrap}} .tabs{{display:flex;gap:26px;border-bottom:1px solid var(--border);margin-top:34px}} .tab{{font-family:var(--font-mono);font-size:11.5px;letter-spacing:.08em;text-transform:uppercase;padding:0 0 12px;text-decoration:none;color:var(--text-dim);border-bottom:2px solid transparent;margin-bottom:-1px}} .tab.active{{color:var(--accent);border-bottom-color:var(--accent)}} .filters{{display:flex;gap:10px;flex-wrap:wrap;margin:24px 0 18px}} .filter{{font-family:var(--font-mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;padding:7px 13px;border-radius:4px;border:1px solid var(--border);text-decoration:none;color:var(--text-dim)}} .filter.active{{border-color:var(--accent);background:var(--bg3);color:var(--accent)}} .group-consensus{{color:var(--accent)}} .group-disagreement{{color:var(--accent-orange)}} .group-novel{{color:var(--accent-purple)}} .group-thin{{color:var(--accent-teal)}} .group-silent{{color:var(--text-dim)}} .legend{{display:flex;gap:26px;flex-wrap:wrap;margin-top:30px;color:var(--text-dim)}}
 .report-layout{{display:grid;grid-template-columns:minmax(0,1fr) 260px;gap:48px;margin-top:30px;align-items:start}} .report-content{{max-width:74ch;font-size:15.5px;line-height:1.75;color:var(--text-muted);overflow-wrap:anywhere}} .report-content h1,.report-content h2,.report-content h3,.report-content h4{{color:var(--text);line-height:1.3;letter-spacing:-.01em;margin:30px 0 8px}} .report-content h1{{font-size:26px}} .report-content h2{{font-size:22px}} .report-content h3{{font-size:20px}} .report-content p,.report-content ul,.report-content ol,.report-content blockquote{{margin:0 0 20px}} .report-content blockquote{{border-left:2px solid var(--accent);padding-left:14px}} .report-content table{{display:block;overflow-x:auto;margin:20px 0}} .report-content th{{color:var(--text)}} .report-content code{{font-family:var(--font-mono);font-size:.9em}} .artifact-card{{position:sticky;top:96px}} .artifact-card p{{font-size:13.5px;line-height:1.6;color:var(--text-muted)}} .artifact-actions{{display:flex;flex-direction:column;gap:8px}} .artifact-action{{box-sizing:border-box;width:100%;margin:0;background:transparent;color:var(--text-muted);border-color:var(--border);font-family:var(--font-mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;text-align:center;cursor:pointer}} .artifact-action:hover{{border-color:var(--accent);color:var(--text)}}
-.heatmap-intro{{max-width:72ch;color:var(--text-muted);line-height:1.65;margin:24px 0 30px}} .claim-document{{display:grid;gap:16px}} .claim-block{{border:1px solid var(--border);border-left:5px solid var(--text-dim);border-radius:4px;padding:20px;background:var(--bg2)}} .claim-block.group-consensus{{border-left-color:var(--accent);background:rgba(43,80,232,.06)}} .claim-block.group-disagreement{{border-left-color:var(--accent-orange);background:rgba(224,92,42,.07)}} .claim-block.group-novel{{border-left-color:var(--accent-purple);background:rgba(122,75,190,.07)}} .claim-block.group-thin{{border-left-color:var(--accent-teal);background:rgba(31,139,134,.07)}} .claim-block.group-silent{{border-left-color:var(--text-dim)}} .claim-block h2{{font-size:19px;line-height:1.45;margin:8px 0 18px}} .claim-models{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}} .claim-model{{border:1px solid var(--border);background:var(--bg);padding:10px;border-radius:4px}} .claim-model .score{{display:inline-block;min-width:28px;padding:4px 7px;margin-right:8px}} .claim-model-name{{font-family:var(--font-mono);font-size:11px;color:var(--text-dim);overflow-wrap:anywhere}} .claim-evidence{{font-size:13px;line-height:1.5;color:var(--text-muted);margin:8px 0 0}}
+.intro{{max-width:72ch;color:var(--text-muted);line-height:1.65;margin:18px 0 30px}} .actions{{max-width:80ch;padding-left:20px}} .actions li{{margin:0 0 12px}} .actions .why{{display:block;font-size:13px;color:var(--text-dim)}} .buckets{{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:20px;margin-top:34px}} .bucket{{border:1px solid var(--border);border-radius:4px;padding:16px 18px;background:var(--bg2)}} .bucket h2{{font-size:13px;letter-spacing:.06em;text-transform:uppercase;color:var(--text-dim);margin:0 0 12px}} .bucket .count{{color:var(--accent);font-family:var(--font-mono)}} .bucket ul{{list-style:none;margin:0;padding:0;display:grid;gap:9px;font-size:14px}} .quiet{{color:var(--text-dim)}} .blind{{margin-top:40px;border-left:3px solid var(--accent-orange);padding-left:16px}} .blind ul{{color:var(--text-muted);font-size:14px;line-height:1.6}} .heatmap-intro{{max-width:72ch;color:var(--text-muted);line-height:1.65;margin:24px 0 30px}} .claim-document{{display:grid;gap:16px}} .claim-block{{border:1px solid var(--border);border-left:5px solid var(--text-dim);border-radius:4px;padding:20px;background:var(--bg2)}} .claim-block.group-consensus{{border-left-color:var(--accent);background:rgba(43,80,232,.06)}} .claim-block.group-disagreement{{border-left-color:var(--accent-orange);background:rgba(224,92,42,.07)}} .claim-block.group-novel{{border-left-color:var(--accent-purple);background:rgba(122,75,190,.07)}} .claim-block.group-thin{{border-left-color:var(--accent-teal);background:rgba(31,139,134,.07)}} .claim-block.group-silent{{border-left-color:var(--text-dim)}} .claim-block h2{{font-size:19px;line-height:1.45;margin:8px 0 18px}} .claim-models{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}} .claim-model{{border:1px solid var(--border);background:var(--bg);padding:10px;border-radius:4px}} .claim-model .score{{display:inline-block;min-width:28px;padding:4px 7px;margin-right:8px}} .claim-model-name{{font-family:var(--font-mono);font-size:11px;color:var(--text-dim);overflow-wrap:anywhere}} .claim-evidence{{font-size:13px;line-height:1.5;color:var(--text-muted);margin:8px 0 0}}
 .raw-list,.provenance-layout{{margin-top:30px}} .raw-call{{border-bottom:1px solid var(--border);padding:16px 0}} .raw-call summary{{display:grid;grid-template-columns:minmax(180px,240px) 1fr auto;gap:20px;align-items:baseline;cursor:pointer}} .raw-call-name{{display:flex;flex-direction:column;gap:3px}} .raw-meta{{font-family:var(--font-mono);font-size:11.5px;color:var(--text-dim)}} .provenance-layout{{display:grid;grid-template-columns:1fr 1fr;gap:48px;align-items:start}} .section-rule{{display:flex;align-items:center;gap:20px;padding-bottom:16px}} .section-rule span:last-child{{flex:1;height:1px;background:var(--border)}} .manifest-row{{display:grid;grid-template-columns:190px 1fr;gap:16px;padding:9px 0;border-bottom:1px solid var(--border)}} .manifest-row dd,.manifest-row dt{{margin:0}} .manifest-row dd{{font-family:var(--font-mono);font-size:12px;color:var(--text-muted);word-break:break-word}} .limitation{{border-left:2px solid var(--border);padding:4px 0 4px 12px;margin-bottom:16px;font-size:14.5px;line-height:1.6}} .empty-state{{border-left:2px solid var(--border);padding-left:14px;color:var(--text-muted)}}
 @media(max-width:900px){{.grid,.report-layout,.provenance-layout{{grid-template-columns:1fr}} .stats{{grid-template-columns:repeat(2,auto)}} .artifact-card{{position:static}} .raw-call summary{{grid-template-columns:1fr}}}} @media(max-width:600px){{main{{padding:28px 18px 100px}} .tabs{{gap:16px;overflow-x:auto}}}}
 </style></head><body><header><div><strong>Alexandria</strong> <span class="mono">Research commissions</span></div><nav><a href="/">Published work</a></nav></header><main>{_tabstrip(tab) if tab else ""}{body}</main><footer style="max-width:1440px;margin:auto;padding:28px 32px 48px;border-top:1px solid var(--border);color:var(--text-dim);font-size:13px"><a href="https://www.dhk.io">www.dhk.io</a> &middot; tool: <a href="https://github.com/dhk/minority-report">dhk/minority-report</a> &middot; corpus: <a href="https://github.com/dhk/alexandria">dhk/alexandria</a></footer></body></html>"""
@@ -259,6 +261,87 @@ token, or open the web surface on the host itself.</p>
 {_commission_form(models)}
 """
     return HTMLResponse(_layout(body, title="New commission · Alexandria", tab="/commission"))
+
+
+def _bucket(title: str, items: list[str], empty: str) -> str:
+    body = (
+        "".join(f"<li>{item}</li>" for item in items)
+        if items
+        else f"<li class='quiet'>{_e(empty)}</li>"
+    )
+    return (
+        f'<section class="bucket"><h2>{_e(title)} <span class="count">{len(items)}</span></h2>'
+        f"<ul>{body}</ul></section>"
+    )
+
+
+async def dashboard(request: Request) -> HTMLResponse:
+    """Where everything is, and what to do next — composed, not invented (#34)."""
+    config: Config = request.app.state.config
+    state = survey(config)
+
+    actions = "".join(
+        f'<li><a href="{_e(action.href)}">{_e(action.label)}</a>'
+        f'<span class="why">{_e(action.why)}</span></li>'
+        for action in state.actions
+    )
+    next_actions = (
+        f'<ol class="actions">{actions}</ol>'
+        if actions
+        else "<p class='quiet'>Nothing is waiting on you.</p>"
+    )
+
+    buckets = "".join(
+        [
+            _bucket(
+                "Needs attention",
+                [
+                    f'<a href="/runs/{_e(run.run_id)}">{_e(run.run_id)}</a> — {_e(reason)}'
+                    for run, reason in state.needs_attention
+                ],
+                "nothing failed or stalled",
+            ),
+            _bucket(
+                "Awaiting approval",
+                [
+                    f"{_e(draft.draft_id)} — drafted, never dispatched"
+                    for draft in state.awaiting_approval
+                ],
+                "no drafts waiting",
+            ),
+            _bucket(
+                "Running",
+                [f'<a href="/runs/{_e(run.run_id)}">{_e(run.run_id)}</a>' for run in state.running],
+                "nothing running",
+            ),
+            _bucket(
+                "Finished here, not yet in the corpus",
+                [
+                    f'<a href="/runs/{_e(run.run_id)}">{_e(run.run_id)}</a> — {_e(run.status)}'
+                    for run in state.awaiting_promotion
+                ],
+                "everything finished has been promoted",
+            ),
+            _bucket(
+                "In the corpus",
+                [
+                    f'<a href="/flow/{_e(inv.slug)}">{_e(inv.title or inv.slug)}</a> — '
+                    f"{_e(inv.current_stage or 'no stage')}"
+                    for inv in state.investigations
+                ],
+                "no investigations yet",
+            ),
+        ]
+    )
+
+    blind = "".join(f"<li>{_e(item)}</li>" for item in state.blind_spots)
+    body = f"""<h1>Dashboard</h1>
+<p class="intro">Composed from the run store and the corpus. Every item below is
+derived from state by plain code — nothing here was suggested by a model.</p>
+<h2>Do next</h2>{next_actions}
+<div class="buckets">{buckets}</div>
+<section class="blind"><h2>What this page cannot see</h2><ul>{blind}</ul></section>"""
+    return HTMLResponse(_layout(body, title="Dashboard — Alexandria", tab="/dashboard"))
 
 
 async def active(request: Request) -> HTMLResponse:
@@ -975,6 +1058,7 @@ def create_app(config: Config | None = None, *, read_only: bool = False) -> Star
         Route("/", homepage),
         Route("/commission", commission),
         Route("/active", active),
+        Route("/dashboard", dashboard),
         Route("/runs/{run_id}", result),
         Route("/runs/{run_id}/report.md", report_markdown),
         Route("/runs/{run_id}/heatmap.html", heatmap_html),
