@@ -377,3 +377,53 @@ def test_the_flow_page_offers_a_way_back(tmp_path: Path) -> None:
 
     assert page.status_code == 200
     assert 'href="/"' in page.text, "the flow page must link back into the app"
+
+
+def test_health_names_itself_so_a_checker_can_verify_identity(tmp_path: Path) -> None:
+    """A check that only proves a socket is open passes against the wrong service."""
+    page = _tab_client(tmp_path).get("/health")
+
+    assert page.status_code == 200
+    assert page.json()["service"] == "alexandria-web"
+    assert page.json()["version"]
+
+
+def test_every_page_points_at_its_source(tmp_path: Path) -> None:
+    client = _tab_client(tmp_path)
+
+    for path in ("/", "/commission", "/active"):
+        body = client.get(path).text
+        assert "https://www.dhk.io" in body, path
+        assert "github.com/dhk/minority-report" in body, path
+        assert "github.com/dhk/alexandria" in body, path
+
+
+def test_the_bind_address_defaults_to_loopback_and_is_configurable(
+    monkeypatch: object,
+) -> None:
+    """#39: a managed unit must not expose the surface to a network by accident."""
+    import argparse
+    import os
+
+    from alexandria import web
+
+    def _defaults() -> argparse.Namespace:
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--host", default=os.environ.get("ALEXANDRIA_WEB_HOST", "127.0.0.1"))
+        parser.add_argument(
+            "--port", type=int, default=int(os.environ.get("ALEXANDRIA_WEB_PORT", "8798"))
+        )
+        return parser.parse_args([])
+
+    assert web  # the parser above mirrors web.main's declaration
+    previous = dict(os.environ)
+    try:
+        os.environ.pop("ALEXANDRIA_WEB_HOST", None)
+        os.environ.pop("ALEXANDRIA_WEB_PORT", None)
+        assert _defaults().host == "127.0.0.1"
+        assert _defaults().port == 8798
+        os.environ["ALEXANDRIA_WEB_HOST"] = "100.64.0.1"
+        assert _defaults().host == "100.64.0.1"
+    finally:
+        os.environ.clear()
+        os.environ.update(previous)

@@ -7,6 +7,7 @@ import csv
 import html
 import io
 import json
+import os
 import sys
 import zipfile
 from collections.abc import Sequence
@@ -18,7 +19,7 @@ from markdown_it import MarkdownIt
 from starlette.applications import Starlette
 from starlette.datastructures import UploadFile
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, RedirectResponse, Response
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
@@ -48,6 +49,7 @@ from alexandria.input_resolution import (
     pasted_input,
     validate_input_set,
 )
+from alexandria.version import service_version
 
 _MARKDOWN = MarkdownIt(
     "commonmark",
@@ -142,7 +144,7 @@ body{{background:var(--bg);color:var(--text);font-family:system-ui;margin:0}} he
 .heatmap-intro{{max-width:72ch;color:var(--text-muted);line-height:1.65;margin:24px 0 30px}} .claim-document{{display:grid;gap:16px}} .claim-block{{border:1px solid var(--border);border-left:5px solid var(--text-dim);border-radius:4px;padding:20px;background:var(--bg2)}} .claim-block.group-consensus{{border-left-color:var(--accent);background:rgba(43,80,232,.06)}} .claim-block.group-disagreement{{border-left-color:var(--accent-orange);background:rgba(224,92,42,.07)}} .claim-block.group-novel{{border-left-color:var(--accent-purple);background:rgba(122,75,190,.07)}} .claim-block.group-thin{{border-left-color:var(--accent-teal);background:rgba(31,139,134,.07)}} .claim-block.group-silent{{border-left-color:var(--text-dim)}} .claim-block h2{{font-size:19px;line-height:1.45;margin:8px 0 18px}} .claim-models{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}} .claim-model{{border:1px solid var(--border);background:var(--bg);padding:10px;border-radius:4px}} .claim-model .score{{display:inline-block;min-width:28px;padding:4px 7px;margin-right:8px}} .claim-model-name{{font-family:var(--font-mono);font-size:11px;color:var(--text-dim);overflow-wrap:anywhere}} .claim-evidence{{font-size:13px;line-height:1.5;color:var(--text-muted);margin:8px 0 0}}
 .raw-list,.provenance-layout{{margin-top:30px}} .raw-call{{border-bottom:1px solid var(--border);padding:16px 0}} .raw-call summary{{display:grid;grid-template-columns:minmax(180px,240px) 1fr auto;gap:20px;align-items:baseline;cursor:pointer}} .raw-call-name{{display:flex;flex-direction:column;gap:3px}} .raw-meta{{font-family:var(--font-mono);font-size:11.5px;color:var(--text-dim)}} .provenance-layout{{display:grid;grid-template-columns:1fr 1fr;gap:48px;align-items:start}} .section-rule{{display:flex;align-items:center;gap:20px;padding-bottom:16px}} .section-rule span:last-child{{flex:1;height:1px;background:var(--border)}} .manifest-row{{display:grid;grid-template-columns:190px 1fr;gap:16px;padding:9px 0;border-bottom:1px solid var(--border)}} .manifest-row dd,.manifest-row dt{{margin:0}} .manifest-row dd{{font-family:var(--font-mono);font-size:12px;color:var(--text-muted);word-break:break-word}} .limitation{{border-left:2px solid var(--border);padding:4px 0 4px 12px;margin-bottom:16px;font-size:14.5px;line-height:1.6}} .empty-state{{border-left:2px solid var(--border);padding-left:14px;color:var(--text-muted)}}
 @media(max-width:900px){{.grid,.report-layout,.provenance-layout{{grid-template-columns:1fr}} .stats{{grid-template-columns:repeat(2,auto)}} .artifact-card{{position:static}} .raw-call summary{{grid-template-columns:1fr}}}} @media(max-width:600px){{main{{padding:28px 18px 100px}} .tabs{{gap:16px;overflow-x:auto}}}}
-</style></head><body><header><div><strong>Alexandria</strong> <span class="mono">Research commissions</span></div><nav><a href="/">Published work</a></nav></header><main>{_tabstrip(tab) if tab else ""}{body}</main></body></html>"""
+</style></head><body><header><div><strong>Alexandria</strong> <span class="mono">Research commissions</span></div><nav><a href="/">Published work</a></nav></header><main>{_tabstrip(tab) if tab else ""}{body}</main><footer style="max-width:1440px;margin:auto;padding:28px 32px 48px;border-top:1px solid var(--border);color:var(--text-dim);font-size:13px"><a href="https://www.dhk.io">www.dhk.io</a> &middot; tool: <a href="https://github.com/dhk/minority-report">dhk/minority-report</a> &middot; corpus: <a href="https://github.com/dhk/alexandria">dhk/alexandria</a></footer></body></html>"""
 
 
 def _input_rows(inputs: Sequence[InputArtifact]) -> str:
@@ -209,6 +211,16 @@ def _commission_form(models: str) -> str:
 <label>Grading model<input name="grading_model" value="{_e(DEFAULT_GRADING_MODEL)}"></label>
 <label>Hard ceiling (USD)<input name="ceiling_usd" type="number" min="0.01" step="0.01" value="1.00"></label>
 <button type="submit">Review commission →</button></div></div></form></section>"""
+
+
+async def health(request: Request) -> Response:
+    """Names itself, so a checker verifies identity rather than "something answered".
+
+    checks.py compares this `service` field against the pack declaration; a
+    health check that only proves a socket is open would pass against whatever
+    else happened to claim the port.
+    """
+    return JSONResponse({"service": "alexandria-web", "version": service_version()})
 
 
 async def homepage(request: Request) -> HTMLResponse:
@@ -882,6 +894,7 @@ async def flow(request: Request) -> Response:
 def create_app(config: Config | None = None) -> Starlette:
     config = config or load_config()
     routes: list[Any] = [
+        Route("/health", health),
         Route("/", homepage),
         Route("/commission", commission),
         Route("/active", active),
@@ -903,8 +916,14 @@ def create_app(config: Config | None = None) -> Starlette:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="alexandria-web")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8042)
+    # Loopback by default: it always binds, it cannot expose the surface to a
+    # network by accident, and the health check can always reach it. Reaching
+    # this from another device means either a tunnel or setting
+    # ALEXANDRIA_WEB_HOST deliberately -- see docs/SERVER-style notes in #39.
+    parser.add_argument("--host", default=os.environ.get("ALEXANDRIA_WEB_HOST", "127.0.0.1"))
+    parser.add_argument(
+        "--port", type=int, default=int(os.environ.get("ALEXANDRIA_WEB_PORT", "8798"))
+    )
     args = parser.parse_args(argv)
     try:
         app = create_app()
