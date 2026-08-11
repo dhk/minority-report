@@ -9,7 +9,7 @@ from pathlib import Path
 from starlette.testclient import TestClient
 
 from alexandria.commission import RunStore
-from alexandria.commission_models import InputArtifact, RunRecord
+from alexandria.commission_models import InputArtifact, RunRecord, RunStatus
 from alexandria.infrastructure.config import Config
 from alexandria.web import create_app
 
@@ -295,3 +295,85 @@ def test_homepage_links_each_investigation_to_its_flow_view(tmp_path: Path) -> N
 
     assert '<a href="/flow/example-slug">An example investigation</a>' in response.text
     assert "bronze" in response.text
+
+
+def _tab_client(tmp_path: Path, *, statuses: tuple[RunStatus, ...] = ()) -> TestClient:
+    repo = tmp_path / "repo"
+    (repo / "research" / "an-investigation").mkdir(parents=True)
+    config = Config(
+        data_dir=tmp_path / "state",
+        data_dir_source="test",
+        repo_root=repo,
+        repo_root_source="test",
+    )
+    store = RunStore(config.data_dir)
+    for index, status in enumerate(statuses):
+        store.write_run(
+            RunRecord(
+                run_id=f"r-{index}-{status}",
+                brief_revision="B",
+                brief_sha256="abc",
+                status=status,
+                created_at=datetime(2026, 7, 28, 12, tzinfo=UTC),
+                grading_model="anthropic/claude-sonnet-4.6",
+                inputs=[],
+                dispatched_models=[],
+            )
+        )
+    return TestClient(create_app(config))
+
+
+def test_every_tab_has_its_own_url_and_marks_itself_active(tmp_path: Path) -> None:
+    client = _tab_client(tmp_path)
+
+    for path, label in (
+        ("/", "Published work"),
+        ("/commission", "New commission"),
+        ("/active", "What&#x27;s active"),
+    ):
+        page = client.get(path)
+        assert page.status_code == 200, path
+        assert f'class="tab active" href="{path}"' in page.text, f"{path} should mark itself active"
+        for other, _ in (("/", ""), ("/commission", ""), ("/active", "")):
+            if other != path:
+                assert f'class="tab" href="{other}"' in page.text, f"{path} should link to {other}"
+
+
+def test_the_landing_tab_is_published_work_not_the_form(tmp_path: Path) -> None:
+    """What exists beats what you might make."""
+    page = _tab_client(tmp_path).get("/")
+
+    assert "Published work" in page.text
+    assert "an-investigation" in page.text
+    assert 'action="/review"' not in page.text, "the commission form belongs on its own tab"
+
+
+def test_an_in_flight_run_appears_under_active_and_a_finished_one_does_not(
+    tmp_path: Path,
+) -> None:
+    client = _tab_client(tmp_path, statuses=("running", "completed"))
+
+    page = client.get("/active")
+
+    assert "r-0-running" in page.text
+    # The finished run is still reachable, below — history with nowhere to live
+    # is history nobody finds.
+    assert "r-1-completed" in page.text
+    assert page.text.index("r-0-running") < page.text.index("Finished runs")
+    assert page.text.index("Finished runs") < page.text.index("r-1-completed")
+
+
+def test_active_says_so_when_nothing_is_running(tmp_path: Path) -> None:
+    page = _tab_client(tmp_path, statuses=("completed",)).get("/active")
+
+    assert "Nothing is running or drafting right now." in page.text
+
+
+def test_the_flow_page_offers_a_way_back(tmp_path: Path) -> None:
+    """#35: opening an investigation used to strand you there."""
+    client = _tab_client(tmp_path)
+
+    page = client.get("/flow/an-investigation")
+
+    assert page.status_code == 200
+    assert 'href="/"' in page.text, "the flow page must link back into the app"
