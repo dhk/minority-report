@@ -8,6 +8,7 @@ import pytest
 
 from alexandria.commission import (
     ASSUMED_COMPLETION_TOKENS,
+    MAX_COMPLETION_TOKENS,
     WEB_SEARCH_COST_USD,
     CommissionError,
     CommissionService,
@@ -73,6 +74,16 @@ class PartialGateway(FakeGateway):
         return await super().complete(model, prompt, web_search=web_search)
 
 
+class TruncatingGateway(FakeGateway):
+    """One research model runs into the completion cap."""
+
+    async def complete(self, model: str, prompt: str, *, web_search: bool = False) -> CallRecord:
+        call = await super().complete(model, prompt, web_search=web_search)
+        if model == "beta/model":
+            return call.model_copy(update={"truncated": True})
+        return call
+
+
 def _config(tmp_path: Path) -> Config:
     return Config(
         data_dir=tmp_path / "state",
@@ -126,6 +137,76 @@ async def test_web_search_sends_the_openrouter_web_plugin() -> None:
     # The model id stays canonical; ":online" would break the /models lookup.
     assert sent[0]["model"] == "alpha/model"
     assert sent[0]["plugins"] == [{"id": "web", "max_results": 5}]
+
+
+@pytest.mark.anyio
+async def test_every_call_names_its_own_completion_cap() -> None:
+    """OpenRouter fills in a max_tokens when a request omits one, and reserves
+    ``max_tokens x completion price`` against the key's credit before
+    generating anything. Omitting the field meant reserving 65,536 tokens a
+    call — a $0.29 three-model run had to hold ~$4 to start, and did not
+    (#50). The cap has to be ours, and it has to be sent."""
+    sent: list[dict[str, Any]] = []
+    async with _gateway_capturing(sent) as gateway:
+        await gateway.complete("alpha/model", "prompt")
+
+    assert sent[0]["max_tokens"] == MAX_COMPLETION_TOKENS
+
+
+@pytest.mark.anyio
+async def test_an_answer_stopped_by_the_cap_is_recorded_as_truncated() -> None:
+    """A cut-off answer is a partial observation, not a complete one. The body
+    is kept; what must not happen is presenting it as a finished answer."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/models"):
+            return _pricing_response()
+        return httpx.Response(
+            200,
+            json={
+                "id": "gen-1",
+                "choices": [{"message": {"content": "half an ans"}, "finish_reason": "length"}],
+                "usage": {"cost": 0.01},
+            },
+        )
+
+    client = httpx.AsyncClient(
+        base_url="https://openrouter.test", transport=httpx.MockTransport(handler)
+    )
+    async with OpenRouterGateway("test-key", client) as gateway:
+        call = await gateway.complete("alpha/model", "prompt")
+
+    assert call.status == "success"
+    assert call.truncated is True
+    assert call.body == "half an ans"
+
+
+@pytest.mark.anyio
+async def test_an_answer_that_finished_is_not_marked_truncated() -> None:
+    sent: list[dict[str, Any]] = []
+    async with _gateway_capturing(sent) as gateway:
+        call = await gateway.complete("alpha/model", "prompt")
+
+    assert call.truncated is False
+
+
+@pytest.mark.anyio
+async def test_a_truncated_answer_says_so_in_the_run_limitations(tmp_path: Path) -> None:
+    """Silence from a model that ran out of room is the cap talking, not the
+    model declining to address a claim — the run has to be able to tell an
+    operator which it was."""
+    service = CommissionService(_config(tmp_path), TruncatingGateway())
+    draft = await service.create_draft(
+        Brief(task="Assess the provider port."),
+        [extract_input("brief.md", b"Keep the port narrow.")],
+        ["alpha/model", "beta/model"],
+        "grader/model",
+        1.0,
+    )
+    run = await service.dispatch(draft.draft_id)
+
+    assert any("beta/model was cut off" in note for note in run.limitations)
+    assert not any("alpha/model was cut off" in note for note in run.limitations)
 
 
 @pytest.mark.anyio

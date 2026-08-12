@@ -54,6 +54,21 @@ WEB_SEARCH_COST_USD = 0.005
 # routinely run longer, which is the single largest reason a run lands above
 # its estimate -- recorded on every run so the gap can be measured, not guessed.
 ASSUMED_COMPLETION_TOKENS = 2_000
+# The cap sent as ``max_tokens`` on every call. Deliberately far above
+# ASSUMED_COMPLETION_TOKENS: that constant predicts a typical answer for
+# pricing, this one bounds the longest answer worth paying for. Observed
+# research answers run 8k-13k completion tokens, so this leaves headroom
+# without inviting a runaway.
+#
+# Sending it at all is the point. OpenRouter fills in a max_tokens when a
+# request omits one (undocumented as prose; visible in its own
+# debug.echo_upstream_body example) and then reserves
+# ``max_tokens x completion price`` against the key's credit BEFORE
+# generating a token. Omitting the field meant reserving 65,536 tokens per
+# call -- $1.64 for one Opus call, $3.01 for a three-model dispatch whose
+# estimate was $0.29 -- and a 402 that killed two calls of run
+# r-2026-0812-02 outright. See issue #50.
+MAX_COMPLETION_TOKENS = 16_000
 # The corpus owns this contract: dhk/alexandria's schemas/claim-score.schema.json.
 # Mirrored here because dispatch must enforce it without a corpus checkout to hand;
 # tests/unit/test_corpus_contract.py fails if the two ever disagree.
@@ -241,6 +256,7 @@ class OpenRouterGateway:
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.1,
+            "max_tokens": MAX_COMPLETION_TOKENS,
         }
         if web_search:
             request_body["plugins"] = [{"id": "web", "max_results": WEB_PLUGIN_MAX_RESULTS}]
@@ -298,6 +314,12 @@ class OpenRouterGateway:
                         cost = _optional_float(generation_data.get("total_cost"))
                 except (httpx.HTTPError, ValueError):
                     pass
+            # A cap that cuts an answer off must say so. The body is still
+            # worth keeping -- a truncated research answer is a partial
+            # observation, not a failed call -- but presenting it as a
+            # complete one would be exactly the silent smoothing this
+            # repository exists to avoid.
+            finish_reason = first.get("finish_reason") if isinstance(first, dict) else None
             return CallRecord(
                 model_id=model,
                 resolved_model_id=str(payload.get("model") or model),
@@ -309,6 +331,7 @@ class OpenRouterGateway:
                 completion_tokens=_optional_int(usage.get("completion_tokens")),
                 cost=cost,
                 latency_ms=latency_ms,
+                truncated=finish_reason == "length",
             )
         except (ValueError, TypeError, KeyError) as exc:
             return CallRecord(
@@ -593,6 +616,12 @@ class CommissionService:
             for call in calls
             if call.status == "failed"
         ]
+        limitations += [
+            f"{call.model_id} was cut off at the {MAX_COMPLETION_TOKENS:,}-token cap; "
+            "its answer is incomplete and its silence on a claim may be the cap talking."
+            for call in calls
+            if call.truncated
+        ]
         if draft.web_search:
             # brief_sha256 pins the question, not the answer: live sources move.
             limitations.append(
@@ -612,6 +641,14 @@ class CommissionService:
                 run_dir / "raw" / "grading.json",
                 _json_bytes(grading_call.model_dump(mode="json")),
             )
+            if grading_call.truncated:
+                # Named separately from the parse error it will almost
+                # certainly cause: "the grader ran out of room" and "the
+                # grader emitted bad JSON" call for different fixes.
+                limitations.append(
+                    f"The grading call was cut off at the {MAX_COMPLETION_TOKENS:,}-token cap; "
+                    "a claim landscape parsed from it, if any, is incomplete."
+                )
             if grading_call.status == "success" and grading_call.body:
                 try:
                     analysis = _parse_json_object(grading_call.body)

@@ -102,6 +102,11 @@ class CallRecord(BaseModel):
     latency_ms: int
     error: str | None = None
     status_code: int | None = None
+    #: The provider stopped at max_tokens rather than finishing the answer
+    #: (finish_reason == "length"). The body is kept -- a truncated answer is
+    #: a partial observation, not an absent one -- but a run must be able to
+    #: say which of its answers were cut off.
+    truncated: bool = False
 
 
 class ScoreRecord(BaseModel):
