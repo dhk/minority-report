@@ -50,10 +50,18 @@ DEFAULT_GRADING_MODEL = "anthropic/claude-sonnet-4.6"
 WEB_PLUGIN_MAX_RESULTS = 5
 # Exa (the default engine) bills $0.005 per request for up to 10 results.
 WEB_SEARCH_COST_USD = 0.005
-# The estimate prices a nominal completion per model. Real research answers
-# routinely run longer, which is the single largest reason a run lands above
-# its estimate -- recorded on every run so the gap can be measured, not guessed.
-ASSUMED_COMPLETION_TOKENS = 2_000
+# What search costs that the per-request fee does not: its results come back as
+# PROMPT tokens on the next call. Measured on one brief run both ways --
+# 529,883 research prompt tokens with search on against 36,263 with it off,
+# across three models. That is ~165k extra per searching model, and it is why a
+# run estimated at $0.2873 cost $3.03 (#49). One observation, not a fit; the
+# review says so rather than implying this number is reliable.
+WEB_SEARCH_PROMPT_TOKENS = 150_000
+# What a research answer actually runs to, measured across every completed call
+# in r-2026-0812-03 and -04: 7,228 / 7,802 / 8,300 / 10,744 completion tokens.
+# The old value here was 2_000, which under-priced every run by about 4x before
+# search entered the picture and made "the estimate" quietly useless (#49).
+ASSUMED_COMPLETION_TOKENS = 8_000
 # The cap sent as ``max_tokens`` on every call. Deliberately far above
 # ASSUMED_COMPLETION_TOKENS: that constant predicts a typical answer for
 # pricing, this one bounds the longest answer worth paying for. Observed
@@ -112,7 +120,12 @@ def _body_excerpt(raw: str, limit: int = 200) -> str:
 
 class Gateway(Protocol):
     async def estimate(
-        self, models: list[str], input_tokens: int, *, web_search: bool = False
+        self,
+        models: list[str],
+        input_tokens: int,
+        *,
+        web_search: bool = False,
+        completion_tokens: int = ASSUMED_COMPLETION_TOKENS,
     ) -> float: ...
 
     async def complete(
@@ -227,8 +240,20 @@ class OpenRouterGateway:
             await self.client.aclose()
 
     async def estimate(
-        self, models: list[str], input_tokens: int, *, web_search: bool = False
+        self,
+        models: list[str],
+        input_tokens: int,
+        *,
+        web_search: bool = False,
+        completion_tokens: int = ASSUMED_COMPLETION_TOKENS,
     ) -> float:
+        """Priced cost for one leg of a run.
+
+        ``completion_tokens`` is what separates the estimate from the bound:
+        pass the assumed length for a prediction, or MAX_COMPLETION_TOKENS for
+        the most this leg can possibly cost. Both come from the same live
+        prices, so they cannot drift apart.
+        """
         response = await self.client.get("/models")
         response.raise_for_status()
         payload = _decode_openrouter_json(response.text)
@@ -245,7 +270,10 @@ class OpenRouterGateway:
             prompt = float(pricing.get("prompt") or 0)
             completion = float(pricing.get("completion") or 0)
             request = float(pricing.get("request") or 0)
-            total += input_tokens * prompt + ASSUMED_COMPLETION_TOKENS * completion + request
+            # Search results arrive as prompt tokens on this same call, so they
+            # are priced as tokens here and not only as the per-request fee.
+            prompt_tokens = input_tokens + (WEB_SEARCH_PROMPT_TOKENS if web_search else 0)
+            total += prompt_tokens * prompt + completion_tokens * completion + request
             if web_search:
                 total += WEB_SEARCH_COST_USD
         return round(total, 6)
@@ -509,10 +537,27 @@ class CommissionService:
         models: list[str],
         grading_model: str,
         ceiling_usd: float,
-        web_search: bool = True,
+        web_search: bool = False,
+        web_search_rationale: str = "",
     ) -> Draft:
         if not brief.task.strip():
             raise CommissionError("The Task field is required.")
+        web_search_rationale = web_search_rationale.strip()
+        if web_search and not web_search_rationale:
+            # Search is the most expensive thing this system can be asked to
+            # do, and the cost is invisible at the point of asking: results
+            # bill as prompt tokens, so the same brief cost $0.75 without it
+            # and $3.03 with it. It also costs the run its reproducibility.
+            # Refusing without a reason is not bureaucracy -- it is the only
+            # moment anyone is required to think about whether this brief
+            # actually needs live sources, or whether training data answers it.
+            raise CommissionError(
+                "Web search needs a reason. It quadrupled the bill on the one brief "
+                "measured both ways ($0.75 -> $3.03, because results are billed as "
+                "prompt tokens) and makes the run unreproducible from its inputs. "
+                "Say what this brief needs live sources for -- recency, a specific "
+                "document, a claim training data cannot settle -- or leave it off."
+            )
         models = list(dict.fromkeys(model.strip() for model in models if model.strip()))
         if len(models) < 2:
             raise CommissionError("Select at least two independent research models.")
@@ -533,6 +578,24 @@ class CommissionService:
             # than pricing twice, so the operator can see which term is which.
             search_estimate = WEB_SEARCH_COST_USD * len(models) if web_search else 0.0
             estimate = round(research_estimate + grading_estimate, 6)
+            # The bound, priced the same way but assuming every model writes
+            # to the cap. This is what the ceiling is checked against: the
+            # estimate above is a prediction and has been wrong by 2.8x, so
+            # enforcing a ceiling against it enforces nothing (#49).
+            worst_case = round(
+                await self.gateway.estimate(
+                    models,
+                    input_tokens,
+                    web_search=web_search,
+                    completion_tokens=MAX_COMPLETION_TOKENS,
+                )
+                + await self.gateway.estimate(
+                    [grading_model],
+                    input_tokens + MAX_COMPLETION_TOKENS * len(models),
+                    completion_tokens=MAX_COMPLETION_TOKENS,
+                ),
+                6,
+            )
             estimate_detail = CostEstimate(
                 research_usd=round(research_estimate - search_estimate, 6),
                 grading_usd=round(grading_estimate, 6),
@@ -542,6 +605,7 @@ class CommissionService:
                 grading_input_tokens=grading_input_tokens,
                 assumed_completion_tokens=ASSUMED_COMPLETION_TOKENS,
                 research_model_count=len(models),
+                worst_case_usd=worst_case,
             )
         except (httpx.HTTPError, CommissionError, ValueError) as exc:
             pricing_error = str(exc)
@@ -557,13 +621,33 @@ class CommissionService:
             estimate_detail=estimate_detail,
             pricing_error=pricing_error,
             web_search=web_search,
+            web_search_rationale=web_search_rationale,
         )
         self.store.save_draft(draft)
         return draft
 
     async def dispatch(self, draft_id: str) -> RunRecord:
         draft = self.store.load_draft(draft_id)
-        if draft.estimate_usd is not None and draft.estimate_usd > draft.ceiling_usd:
+        # The ceiling is checked against the BOUND, not the prediction. A
+        # ceiling compared only against an estimate stops nothing: r-2026-0812-03
+        # was estimated at $0.2873, passed a $1.00 ceiling, and cost $3.0321
+        # (#49). If the worst case does not fit, the honest answer is to refuse
+        # before spending anything and let the operator set a real number.
+        worst_case = draft.estimate_detail.worst_case_usd if draft.estimate_detail else None
+        if worst_case is not None and worst_case > draft.ceiling_usd:
+            raise CommissionError(
+                f"This run can cost up to ${worst_case:.4f} if every model writes to the "
+                f"{MAX_COMPLETION_TOKENS:,}-token cap, which exceeds the ${draft.ceiling_usd:.4f} "
+                f"ceiling. The estimate is ${draft.estimate_usd:.4f}, but an estimate is not a "
+                "cap. Raise the ceiling deliberately, drop a model, or turn web search off."
+            )
+        # No live pricing means no bound could be computed; the estimate is all
+        # there is to check against, which is weaker and should say so.
+        if (
+            worst_case is None
+            and draft.estimate_usd is not None
+            and draft.estimate_usd > draft.ceiling_usd
+        ):
             raise CommissionError(
                 f"Estimate ${draft.estimate_usd:.4f} exceeds ceiling ${draft.ceiling_usd:.4f}."
             )
@@ -632,6 +716,19 @@ class CommissionService:
         scores: list[ScoreRecord] = []
         grading_call: CallRecord | None = None
         report = "# Result\n\n## What this run does not establish\n\nModel agreement is not verification.\n"
+        # The research calls are away and billed; grading is the one decision
+        # still open, so it is where a ceiling can still bite. Web search makes
+        # the modelled worst case unreliable on the input side -- results arrive
+        # as prompt tokens nobody bounded -- so check what was actually spent
+        # rather than trusting the bound that let this run start.
+        spent = sum(call.cost or 0.0 for call in calls)
+        if successful and spent >= draft.ceiling_usd:
+            limitations.append(
+                f"The grading call was not made: research already spent ${spent:.4f} of the "
+                f"${draft.ceiling_usd:.4f} ceiling. The research outputs are preserved and can "
+                "be graded by re-running with a higher ceiling; no claim landscape exists yet."
+            )
+            successful = []
         if successful:
             grading_call = await self.gateway.complete(
                 draft.grading_model,

@@ -10,6 +10,7 @@ from alexandria.commission import (
     ASSUMED_COMPLETION_TOKENS,
     MAX_COMPLETION_TOKENS,
     WEB_SEARCH_COST_USD,
+    WEB_SEARCH_PROMPT_TOKENS,
     CommissionError,
     CommissionService,
     OpenRouterGateway,
@@ -25,10 +26,17 @@ class FakeGateway:
         self.web_search_by_model: dict[str, bool] = {}
 
     async def estimate(
-        self, models: list[str], input_tokens: int, *, web_search: bool = False
+        self,
+        models: list[str],
+        input_tokens: int,
+        *,
+        web_search: bool = False,
+        completion_tokens: int = ASSUMED_COMPLETION_TOKENS,
     ) -> float:
         assert input_tokens > 0
-        return 0.25
+        # The worst case asks the same question with the cap substituted, so a
+        # fake that ignored completion_tokens would make the bound untestable.
+        return 0.25 * (completion_tokens / ASSUMED_COMPLETION_TOKENS)
 
     async def complete(self, model: str, prompt: str, *, web_search: bool = False) -> CallRecord:
         self.web_search_by_model[model] = web_search
@@ -298,15 +306,36 @@ async def test_a_non_object_completion_body_fails_the_call_not_the_run() -> None
 
 
 @pytest.mark.anyio
-async def test_estimate_charges_for_each_searching_model() -> None:
+async def test_estimate_prices_search_as_tokens_not_just_a_per_request_fee() -> None:
+    """The old estimate added $0.005 a search and called it done, which is why a
+    $0.2873 run cost $3.03: results come back as PROMPT tokens on the same call,
+    and 165k of them per model is the actual bill (#49)."""
     sent: list[dict[str, Any]] = []
     async with _gateway_capturing(sent) as gateway:
         plain = await gateway.estimate(["alpha/model"], 1_000)
-        searching = await gateway.estimate(["alpha/model"], 1_000)
         with_search = await gateway.estimate(["alpha/model"], 1_000, web_search=True)
 
-    assert plain == searching
-    assert with_search == pytest.approx(plain + WEB_SEARCH_COST_USD)
+    prompt_price = 0.000001  # _pricing_response
+    assert with_search == pytest.approx(
+        plain + WEB_SEARCH_COST_USD + WEB_SEARCH_PROMPT_TOKENS * prompt_price
+    )
+
+
+@pytest.mark.anyio
+async def test_the_worst_case_prices_the_cap_not_the_assumption() -> None:
+    """The number the ceiling is checked against. Same prices, completion length
+    swapped for the cap every call is now sent with."""
+    sent: list[dict[str, Any]] = []
+    async with _gateway_capturing(sent) as gateway:
+        assumed = await gateway.estimate(["alpha/model"], 1_000)
+        bound = await gateway.estimate(
+            ["alpha/model"], 1_000, completion_tokens=MAX_COMPLETION_TOKENS
+        )
+
+    completion_price = 0.000002  # _pricing_response
+    assert bound - assumed == pytest.approx(
+        (MAX_COMPLETION_TOKENS - ASSUMED_COMPLETION_TOKENS) * completion_price
+    )
 
 
 def test_claim_group_precedence() -> None:
@@ -349,7 +378,7 @@ async def test_commission_persists_accepted_run_shapes(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
-async def test_research_searches_the_web_by_default_but_grading_does_not(tmp_path: Path) -> None:
+async def test_research_searches_when_asked_but_grading_never_does(tmp_path: Path) -> None:
     gateway = FakeGateway()
     service = CommissionService(_config(tmp_path), gateway)
     draft = await service.create_draft(
@@ -357,7 +386,9 @@ async def test_research_searches_the_web_by_default_but_grading_does_not(tmp_pat
         [extract_input("brief.md", b"Keep the port narrow.")],
         ["alpha/model", "beta/model"],
         "grader/model",
-        1.0,
+        4.0,
+        web_search=True,
+        web_search_rationale="The port's current upstream behaviour changed this month.",
     )
     assert draft.web_search is True
     run = await service.dispatch(draft.draft_id)
@@ -402,7 +433,7 @@ async def test_dispatch_refuses_estimate_over_ceiling(tmp_path: Path) -> None:
         "grader/model",
         0.10,
     )
-    with pytest.raises(CommissionError, match="exceeds ceiling"):
+    with pytest.raises(CommissionError, match="an estimate is not a cap"):
         await service.dispatch(draft.draft_id)
     assert service.store.list_runs() == []
 
@@ -438,7 +469,9 @@ async def test_estimate_components_account_for_the_whole_total(tmp_path: Path) -
         [extract_input("brief.md", b"Keep the port narrow.")],
         ["alpha/model", "beta/model"],
         "grader/model",
-        1.0,
+        4.0,
+        web_search=True,
+        web_search_rationale="Needs sources published after training cutoff.",
     )
     detail = draft.estimate_detail
     assert detail is not None
@@ -525,3 +558,83 @@ async def test_cost_json_is_listed_as_a_run_artifact(tmp_path: Path) -> None:
         (service.store.run_dir(run.run_id) / "manifest.json").read_text(encoding="utf-8")
     )
     assert "cost.json" in manifest["artifacts"]
+
+
+@pytest.mark.anyio
+async def test_the_ceiling_is_checked_against_the_bound_not_the_prediction(
+    tmp_path: Path,
+) -> None:
+    """r-2026-0812-03 was estimated at $0.2873, cleared a $1.00 ceiling that
+    called itself 'the only bound that is enforced', and cost $3.0321. A ceiling
+    compared only against an estimate stops nothing (#49)."""
+    service = CommissionService(_config(tmp_path), FakeGateway())
+    draft = await service.create_draft(
+        Brief(task="Assess the provider port."),
+        [extract_input("brief.md", b"Keep the port narrow.")],
+        ["alpha/model", "beta/model"],
+        "grader/model",
+        0.6,
+    )
+    detail = draft.estimate_detail
+    assert detail is not None and detail.worst_case_usd is not None
+    # The estimate fits; the bound does not. Before this, that dispatched.
+    assert draft.estimate_usd is not None and draft.estimate_usd < 0.6
+    assert detail.worst_case_usd > 0.6
+
+    with pytest.raises(CommissionError, match="an estimate is not a cap"):
+        await service.dispatch(draft.draft_id)
+
+    assert service.store.list_runs() == []
+
+
+@pytest.mark.anyio
+async def test_web_search_without_a_reason_is_refused(tmp_path: Path) -> None:
+    """The expensive option has to say what it is for. This is the only moment
+    anyone is made to ask whether the brief needs live sources at all."""
+    service = CommissionService(_config(tmp_path), FakeGateway())
+
+    with pytest.raises(CommissionError, match="Web search needs a reason"):
+        await service.create_draft(
+            Brief(task="Assess the provider port."),
+            [extract_input("brief.md", b"Keep the port narrow.")],
+            ["alpha/model", "beta/model"],
+            "grader/model",
+            4.0,
+            web_search=True,
+        )
+
+
+@pytest.mark.anyio
+async def test_the_reason_is_carried_into_the_draft_for_the_operator_to_approve(
+    tmp_path: Path,
+) -> None:
+    """Approving a flag is not approving a reason. The review shows the words."""
+    service = CommissionService(_config(tmp_path), FakeGateway())
+
+    draft = await service.create_draft(
+        Brief(task="Assess the provider port."),
+        [extract_input("brief.md", b"Keep the port narrow.")],
+        ["alpha/model", "beta/model"],
+        "grader/model",
+        4.0,
+        web_search=True,
+        web_search_rationale="  The upstream spec changed after the training cutoff.  ",
+    )
+
+    assert draft.web_search_rationale == "The upstream spec changed after the training cutoff."
+
+
+@pytest.mark.anyio
+async def test_search_is_off_unless_asked_for(tmp_path: Path) -> None:
+    service = CommissionService(_config(tmp_path), FakeGateway())
+
+    draft = await service.create_draft(
+        Brief(task="Assess the provider port."),
+        [extract_input("brief.md", b"Keep the port narrow.")],
+        ["alpha/model", "beta/model"],
+        "grader/model",
+        4.0,
+    )
+
+    assert draft.web_search is False
+    assert draft.web_search_rationale == ""

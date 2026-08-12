@@ -31,6 +31,7 @@ from starlette.responses import JSONResponse
 from alexandria.commission import (
     DEFAULT_GRADING_MODEL,
     DEFAULT_MODELS,
+    MAX_COMPLETION_TOKENS,
     CommissionError,
     CommissionService,
     OpenRouterGateway,
@@ -279,9 +280,22 @@ def _draft_review(draft: Draft) -> str:
     ]
     model_lines = [f"  - {model}" for model in draft.models]
     web_search_line = (
-        "Web search: on — research models read live sources, so this run is not reproducible."
+        "Web search: on — research models read live sources, so this run is not reproducible.\n"
+        f"  Reason given: {draft.web_search_rationale}\n"
+        "  Search results are billed as prompt tokens. On the one brief measured both\n"
+        "  ways this took the run from $0.75 to $3.03."
         if draft.web_search
         else "Web search: off — research models answer from training data only."
+    )
+    detail = draft.estimate_detail
+    ceiling_line = (
+        f"Hard ceiling: ${draft.ceiling_usd:.2f}. This run cannot exceed "
+        f"${detail.worst_case_usd:.4f} — every model writing to the "
+        f"{MAX_COMPLETION_TOKENS:,}-token cap — and dispatch refuses if that "
+        "worst case does not fit."
+        if detail is not None and detail.worst_case_usd is not None
+        else f"Hard ceiling: ${draft.ceiling_usd:.2f}, checked against the estimate only: "
+        "live pricing was unavailable, so no bound could be computed."
     )
     return "\n".join(
         [
@@ -289,7 +303,7 @@ def _draft_review(draft: Draft) -> str:
             f"Draft: {draft.draft_id}",
             f"Estimate: {estimate}",
             *estimate_lines,
-            f"Hard ceiling: ${draft.ceiling_usd:.2f} — the only bound that is enforced.",
+            ceiling_line,
             pricing_note,
             "",
             "Inputs:",
@@ -418,7 +432,8 @@ async def begin_research(
     models: list[str] | None = None,
     grading_model: str = DEFAULT_GRADING_MODEL,
     ceiling_usd: float = 1.0,
-    web_search: bool = True,
+    web_search: bool = False,
+    web_search_rationale: str = "",
 ) -> str:
     """Begin a research commission from pasted text and/or a supported GitHub URL.
 
@@ -430,8 +445,23 @@ async def begin_research(
 
     ``web_search`` gives the research models live web access through OpenRouter's
     web plugin, so claims can rest on fetched sources rather than recalled ones.
-    It is on by default. Turning it off makes a run reproducible from its inputs
-    alone, at the cost of everything the models cannot already recall.
+    It is OFF by default, and turning it on requires ``web_search_rationale``.
+
+    Do not pass ``web_search=True`` because the brief sounds researchy. Ask the
+    operator what it is for, and pass their answer. Search earns its cost when
+    the question turns on something training data cannot settle: events after
+    the model's cutoff, a specific document that must be read as it stands
+    today, a contested claim where the current state of the argument matters.
+    It does not earn its cost for established standards, textbook material, or
+    anything the models already know — and on the one brief measured both ways
+    it quadrupled the bill, $0.75 to $3.03, because search results are billed
+    as prompt tokens on top of everything else. It also costs the run its
+    reproducibility: a searching run rests on pages as they read that day.
+
+    If the operator's reason amounts to "it might find something useful", that
+    is a no. Say so, and offer to run it without search first — the offline run
+    is cheap enough to be the default attempt, and its gaps tell you whether
+    search was needed after all.
     """
     config = _config_or_message()
     if isinstance(config, str):
@@ -464,6 +494,7 @@ async def begin_research(
                 grading_model.strip(),
                 ceiling_usd,
                 web_search,
+                web_search_rationale,
             )
         return _draft_review(draft)
     except (
