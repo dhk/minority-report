@@ -13,6 +13,7 @@ from alexandria.commission import (
     CommissionError,
     CommissionService,
     OpenRouterGateway,
+    _parse_analysis,
     classify_scores,
 )
 from alexandria.commission_models import Brief, CallRecord
@@ -84,6 +85,27 @@ class TruncatingGateway(FakeGateway):
         return call
 
 
+class UnescapedQuoteGateway(FakeGateway):
+    """A grader that obeys "quote the span verbatim" on a span containing quotes.
+
+    The shape is taken from run r-2026-0812-03, which was billed for grading
+    and then discarded because six characters like these would not parse.
+    """
+
+    async def complete(self, model: str, prompt: str, *, web_search: bool = False) -> CallRecord:
+        call = await super().complete(model, prompt, web_search=web_search)
+        if model != "grader/model":
+            return call
+        body = (
+            '{"claims":[{"text":"The provider port should remain narrow.",'
+            '"scores":[{"model_index":1,"score":3,'
+            '"quote":"acknowledges \'if the honest answer is "it depends"\' here"},'
+            '{"model_index":2,"score":0,"quote":""}]}],'
+            '"report_markdown":"# Report\\n\\n## What this run does not establish\\n\\nTruth."}'
+        )
+        return call.model_copy(update={"body": body})
+
+
 def _config(tmp_path: Path) -> Config:
     return Config(
         data_dir=tmp_path / "state",
@@ -137,6 +159,56 @@ async def test_web_search_sends_the_openrouter_web_plugin() -> None:
     # The model id stays canonical; ":online" would break the /models lookup.
     assert sent[0]["model"] == "alpha/model"
     assert sent[0]["plugins"] == [{"id": "web", "max_results": 5}]
+
+
+def test_a_valid_grading_response_is_never_rewritten() -> None:
+    """Repair is a fallback, not a pass. A response that parses must come back
+    byte-for-byte as the grader meant it, with no repairs claimed."""
+    body = '{"claims":[],"report_markdown":"# R\\n\\n## What this run does not establish\\n\\nX."}'
+
+    parsed, repairs = _parse_analysis(body)
+
+    assert repairs == 0
+    assert parsed["report_markdown"].startswith("# R")
+
+
+def test_a_quote_containing_quotes_is_repaired_not_discarded() -> None:
+    """The failure that cost run r-2026-0812-03 its whole grading pass: the
+    prompt demands verbatim spans, and verbatim spans of writing about writing
+    contain quotation marks."""
+    body = '{"claims":[],"report_markdown":"he said "it depends" and stopped"}'
+
+    parsed, repairs = _parse_analysis(body)
+
+    assert repairs == 2
+    assert parsed["report_markdown"] == 'he said "it depends" and stopped'
+
+
+def test_a_response_with_nothing_to_repair_still_fails_honestly() -> None:
+    """Truncation, a missing brace, a prose apology — none of those are this
+    bug, and inventing a repair for them would hide a different failure."""
+    with pytest.raises(ValueError):
+        _parse_analysis('{"claims":[{"text":"cut off mid-')
+
+
+@pytest.mark.anyio
+async def test_a_repaired_grading_response_says_so_in_the_limitations(tmp_path: Path) -> None:
+    """Silent repair would be its own kind of smoothing: an operator has to be
+    able to tell a clean grading pass from a salvaged one."""
+    service = CommissionService(_config(tmp_path), UnescapedQuoteGateway())
+    draft = await service.create_draft(
+        Brief(task="Assess the provider port."),
+        [extract_input("brief.md", b"Keep the port narrow.")],
+        ["alpha/model", "beta/model"],
+        "grader/model",
+        1.0,
+    )
+    run = await service.dispatch(draft.draft_id)
+
+    # The claim landscape survived, which is the whole point.
+    claims = json.loads((service.store.run_dir(run.run_id) / "claims.json").read_text())
+    assert len(claims) == 1
+    assert any("unescaped quote(s)" in note for note in run.limitations)
 
 
 @pytest.mark.anyio

@@ -428,6 +428,77 @@ def _parse_json_object(text: str) -> dict[str, Any]:
     return parsed
 
 
+def _escape_stray_quotes(text: str) -> tuple[str, int]:
+    """Escape double quotes inside strings that cannot be terminators.
+
+    The grading prompt demands verbatim quotes, and verbatim spans of
+    writing about writing contain quotation marks. A grader that obeys the
+    instruction produces JSON that does not parse:
+
+        "quote": "acknowledges 'if the honest answer is "it depends"'"
+
+    Six such characters in 38,782 discarded an entire billed grading pass in
+    run r-2026-0812-03 (issue #51). The rule applied here is structural, not
+    a guess about content: inside a string, a double quote can only be a
+    terminator when the next non-whitespace character is one of ``,}]:`` --
+    anything else means the model was quoting, so the quote is escaped.
+
+    Returns the text and how many quotes were escaped, so a caller can say
+    that repair happened rather than hiding it. A well-formed response is
+    returned unchanged with a count of zero.
+    """
+    out: list[str] = []
+    in_string = False
+    index = 0
+    repairs = 0
+    while index < len(text):
+        char = text[index]
+        if not in_string:
+            out.append(char)
+            in_string = char == '"'
+            index += 1
+        elif char == "\\":
+            out.append(text[index : index + 2])  # keep existing escapes intact
+            index += 2
+        elif char == '"':
+            following = re.match(r"\s*(.)", text[index + 1 :])
+            if following and following.group(1) in ",}]:":
+                out.append(char)
+                in_string = False
+            else:
+                out.append('\\"')
+                repairs += 1
+            index += 1
+        else:
+            # A literal newline is illegal inside a JSON string; a grader that
+            # emits one has made the same class of mistake.
+            out.append("\\n" if char == "\n" else char)
+            index += 1
+    return "".join(out), repairs
+
+
+def _parse_analysis(body: str) -> tuple[dict[str, Any], int]:
+    """The grading payload, repaired only if it will not parse as given.
+
+    Strict first: a valid response must never be rewritten. Repair is a
+    fallback for the one failure mode above, and the number of repairs comes
+    back with the payload so the run can record that it happened.
+    """
+    try:
+        return _parse_json_object(body), 0
+    except (ValueError, TypeError):
+        stripped = body.strip()
+        if stripped.startswith("```"):
+            stripped = re.sub(r"^```(?:json)?\s*|\s*```$", "", stripped, flags=re.DOTALL)
+        repaired, repairs = _escape_stray_quotes(stripped)
+        if not repairs:
+            raise  # nothing to fix; the original error is the honest one
+        parsed = json.loads(repaired)
+        if not isinstance(parsed, dict):
+            raise TypeError("analysis response is not a JSON object") from None
+        return parsed, repairs
+
+
 def _claims_and_scores(
     payload: dict[str, Any], calls: list[CallRecord], grading_call_id: str | None
 ) -> tuple[list[ClaimRecord], list[ScoreRecord]]:
@@ -651,7 +722,13 @@ class CommissionService:
                 )
             if grading_call.status == "success" and grading_call.body:
                 try:
-                    analysis = _parse_json_object(grading_call.body)
+                    analysis, repairs = _parse_analysis(grading_call.body)
+                    if repairs:
+                        limitations.append(
+                            f"The grading response was not valid JSON; {repairs} unescaped "
+                            "quote(s) inside quoted spans were escaped so it could be read. "
+                            "The raw response is kept verbatim in raw/grading.json."
+                        )
                     claims, scores = _claims_and_scores(analysis, calls, grading_call.generation_id)
                     report = str(analysis.get("report_markdown") or report)
                 except (ValueError, TypeError, KeyError) as exc:
