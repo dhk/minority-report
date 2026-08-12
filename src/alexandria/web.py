@@ -236,6 +236,19 @@ async def homepage(request: Request) -> HTMLResponse:
 
 async def commission(request: Request) -> HTMLResponse:
     models = "\n".join(DEFAULT_MODELS)
+    if getattr(request.app.state, "read_only", False):
+        # Rendering the form here would be a lie: its POST target does not
+        # exist on this instance, so the operator would compose a whole brief
+        # and lose it to a 405.
+        body = """
+<h1>This instance is read-only.</h1>
+<p>It serves finished work and cannot commission anything: the routes that
+review a draft and dispatch a run are not mounted here, because this surface
+has no authentication and dispatching spends real money.</p>
+<p>Commission through the MCP server, which is authenticated by its capability
+token, or open the web surface on the host itself.</p>
+"""
+        return HTMLResponse(_layout(body, title="Read-only · Alexandria", tab="/commission"))
     body = f"""
 <h1>Commission the same question to several models.</h1>
 <p>Keep what each one said. Agreement is model agreement. It is not verification.</p>
@@ -891,26 +904,45 @@ async def flow(request: Request) -> Response:
     return HTMLResponse(render_flow_page(flow_document_json(document)))
 
 
-def create_app(config: Config | None = None) -> Starlette:
+def create_app(config: Config | None = None, *, read_only: bool = False) -> Starlette:
+    """The web surface. ``read_only`` omits every route that writes or spends.
+
+    This surface has no authentication of any kind, and ``POST /dispatch``
+    spends real money against the OpenRouter key. That is defensible while it
+    is bound to loopback, which is the default and which its own ``main``
+    comment explains. It stops being defensible the moment the surface is
+    reachable from another machine -- a tailnet route, a tunnel, a changed
+    ALEXANDRIA_WEB_HOST -- because reachable then means anyone who reaches it
+    can commission runs.
+
+    Omitting the routes is deliberately not the same as authenticating them:
+    a read-only instance cannot be talked into dispatching, whereas a
+    password can. Something that needs to commission remotely should use the
+    MCP server, whose capability token already exists for exactly this.
+    """
     config = config or load_config()
     routes: list[Any] = [
         Route("/health", health),
         Route("/", homepage),
         Route("/commission", commission),
         Route("/active", active),
-        Route("/review", review, methods=["POST"]),
-        Route("/dispatch/{draft_id}", dispatch, methods=["POST"]),
         Route("/runs/{run_id}", result),
         Route("/runs/{run_id}/report.md", report_markdown),
         Route("/runs/{run_id}/heatmap.html", heatmap_html),
         Route("/runs/{run_id}/bundle.zip", artifact_bundle),
         Route("/flow/{slug}", flow),
     ]
+    if not read_only:
+        routes += [
+            Route("/review", review, methods=["POST"]),
+            Route("/dispatch/{draft_id}", dispatch, methods=["POST"]),
+        ]
     matches = list((config.repo_root / "docs/ux/prototype/_ds").glob("dhk-design-system-*"))
     if matches:
         routes.append(Mount("/assets", app=StaticFiles(directory=matches[0]), name="assets"))
     app = Starlette(routes=routes)
     app.state.config = config
+    app.state.read_only = read_only
     return app
 
 
@@ -924,9 +956,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--port", type=int, default=int(os.environ.get("ALEXANDRIA_WEB_PORT", "8798"))
     )
+    # The flag to reach for whenever --host is not loopback. It is not
+    # authentication and does not pretend to be: it removes the routes that
+    # write and spend, so an instance that is reachable by other machines
+    # cannot be made to commission anything.
+    parser.add_argument(
+        "--read-only",
+        action="store_true",
+        default=os.environ.get("ALEXANDRIA_WEB_READ_ONLY", "").strip().lower()
+        in {"1", "true", "yes", "on"},
+        help="serve finished work only; omit the review and dispatch routes",
+    )
     args = parser.parse_args(argv)
     try:
-        app = create_app()
+        app = create_app(read_only=args.read_only)
     except (HostEnvironmentError, RepoNotFoundError) as exc:
         print(f"alexandria-web: {exc}", file=sys.stderr)
         return 1

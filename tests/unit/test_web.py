@@ -427,3 +427,52 @@ def test_the_bind_address_defaults_to_loopback_and_is_configurable(
     finally:
         os.environ.clear()
         os.environ.update(previous)
+
+
+def test_read_only_refuses_to_mount_the_routes_that_spend(tmp_path: Path) -> None:
+    """The surface has no authentication and POST /dispatch spends real money.
+    Reachable from another machine, that means anyone who reaches it can
+    commission runs — so the routes are absent, not merely discouraged."""
+    client = TestClient(create_app(_discoverability_config(tmp_path), read_only=True))
+
+    dispatched = client.post("/dispatch/d-whatever")
+    reviewed = client.post("/review", data={"task": "anything"})
+
+    assert dispatched.status_code == 404
+    assert reviewed.status_code == 404
+
+
+def test_read_only_still_serves_finished_work(tmp_path: Path) -> None:
+    """Read-only is for reading: taking the write routes away must not cost
+    the reader anything."""
+    client = TestClient(create_app(_discoverability_config(tmp_path), read_only=True))
+
+    assert client.get("/health").status_code == 200
+    assert client.get("/").status_code == 200
+    assert client.get("/active").status_code == 200
+
+
+def test_read_only_says_so_instead_of_rendering_a_form_that_cannot_post(
+    tmp_path: Path,
+) -> None:
+    """Rendering the form would be a lie: its POST target is not mounted, so
+    an operator would compose a whole brief and lose it to a 405."""
+    client = TestClient(create_app(_discoverability_config(tmp_path), read_only=True))
+
+    response = client.get("/commission")
+
+    assert response.status_code == 200
+    assert "read-only" in response.text.lower()
+    assert 'action="/review"' not in response.text
+
+
+def test_the_writable_default_is_unchanged(tmp_path: Path) -> None:
+    """Loopback-bound, the writable surface is the product. read_only is opt-in."""
+    client = TestClient(create_app(_discoverability_config(tmp_path)))
+
+    response = client.get("/commission")
+
+    assert 'action="/review"' in response.text
+    # A POST that reaches the handler and fails validation is a mounted route;
+    # 404 would mean it was not mounted at all.
+    assert client.post("/review", data={"task": ""}).status_code != 404
