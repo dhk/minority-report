@@ -58,6 +58,11 @@ class CostEstimate(BaseModel):
     grading_input_tokens: int
     assumed_completion_tokens: int
     research_model_count: int
+    #: What this run cannot exceed if every model writes to the completion cap:
+    #: the number the ceiling is actually checked against. The estimate above
+    #: is a prediction and has been wrong by 2.8x on a measured run; this is a
+    #: bound. None when live pricing could not be read.
+    worst_case_usd: float | None = None
 
 
 class CostActual(BaseModel):
@@ -86,7 +91,15 @@ class Draft(BaseModel):
     estimate_usd: float | None
     estimate_detail: CostEstimate | None = None
     pricing_error: str | None = None
-    web_search: bool = True
+    #: Off by default. Live search quadrupled the bill on the one brief where
+    #: both were measured ($0.75 -> $3.03), because results arrive as prompt
+    #: tokens, and it costs the run its reproducibility. Turning it on is a
+    #: decision, so it has to be made explicitly and said out loud below.
+    web_search: bool = False
+    #: Why this brief needs live sources. Required when web_search is on, and
+    #: shown in the review so the operator approves the reason, not just the
+    #: flag.
+    web_search_rationale: str = ""
 
 
 class CallRecord(BaseModel):

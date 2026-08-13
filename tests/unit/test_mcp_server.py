@@ -294,11 +294,16 @@ class FakeCommissionGateway:
         return None
 
     async def estimate(
-        self, models: list[str], input_tokens: int, *, web_search: bool = False
+        self,
+        models: list[str],
+        input_tokens: int,
+        *,
+        web_search: bool = False,
+        completion_tokens: int = 8_000,
     ) -> float:
         assert models
         assert input_tokens > 0
-        return 0.10
+        return 0.10 * (completion_tokens / 8_000)
 
     async def complete(self, model: str, prompt: str, *, web_search: bool = False) -> CallRecord:
         if model == "grader/model":
@@ -448,8 +453,9 @@ def _priced_draft(estimate_usd: float, ceiling_usd: float = 1.0) -> Draft:
             total_usd=estimate_usd,
             input_tokens=1_000,
             grading_input_tokens=5_000,
-            assumed_completion_tokens=2_000,
+            assumed_completion_tokens=8_000,
             research_model_count=2,
+            worst_case_usd=0.80,
         ),
     )
 
@@ -471,9 +477,18 @@ def test_draft_review_shows_what_the_estimate_is_made_of() -> None:
 
 def test_draft_review_names_what_the_estimate_does_not_cover() -> None:
     review = _draft_review(_priced_draft(0.50))
-    assert "2,000 completion tokens" in review
+    assert "8,000 completion tokens" in review
     assert "retries" in review
-    assert "only bound that is enforced" in review
+
+
+def test_draft_review_states_the_bound_the_ceiling_is_checked_against() -> None:
+    """The old line called the ceiling "the only bound that is enforced" while
+    comparing it against an estimate that was wrong by 2.8x. Now the review
+    quotes the worst case, which is what dispatch actually refuses on (#49)."""
+    review = _draft_review(_priced_draft(0.50))
+
+    assert "cannot exceed" in review
+    assert "16,000-token cap" in review
 
 
 def test_draft_review_survives_a_draft_with_no_breakdown() -> None:

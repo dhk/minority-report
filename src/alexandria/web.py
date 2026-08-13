@@ -210,6 +210,7 @@ def _commission_form(models: str) -> str:
 <label>Research models<textarea name="models">{_e(models)}</textarea></label>
 <label>Grading model<input name="grading_model" value="{_e(DEFAULT_GRADING_MODEL)}"></label>
 <label>Hard ceiling (USD)<input name="ceiling_usd" type="number" min="0.01" step="0.01" value="1.00"></label>
+<label>Why this needs live web search<textarea name="web_search_rationale" placeholder="Leave empty for no search. Search roughly quadruples the bill and makes the run unreproducible — it earns that when the question turns on something training data cannot settle."></textarea></label>
 <button type="submit">Review commission →</button></div></div></form></section>"""
 
 
@@ -309,7 +310,18 @@ async def review(request: Request) -> HTMLResponse:
         ceiling = float(ceiling_value) if isinstance(ceiling_value, str | int | float) else 1.0
         async with OpenRouterGateway(openrouter_api_key()) as gateway:
             service = CommissionService(request.app.state.config, gateway)
-            draft = await service.create_draft(brief, inputs, models, grading_model, ceiling)
+            # Web search is off unless the form gives a reason for it, matching
+            # the MCP surface: the expensive option has to say what it is for.
+            rationale = str(form.get("web_search_rationale") or "").strip()
+            draft = await service.create_draft(
+                brief,
+                inputs,
+                models,
+                grading_model,
+                ceiling,
+                web_search=bool(rationale),
+                web_search_rationale=rationale,
+            )
     except (CommissionError, InputResolutionError, SecretNotFoundError, ValueError) as exc:
         return HTMLResponse(
             _layout(
