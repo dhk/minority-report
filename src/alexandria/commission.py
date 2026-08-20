@@ -425,6 +425,34 @@ def _research_prompt(brief: Brief, inputs: list[InputArtifact]) -> str:
     return "\n\n".join(sections)
 
 
+#: docs/confidence-calibration.md §4. The grader is never asked for the number:
+#: it emits (stance, strength) and this table produces the integer. Storing the
+#: pair is what makes a mapping change re-appliable to runs already banked --
+#: before this, no score in the corpus could be recomputed without re-grading.
+SCORE_BY_STANCE_STRENGTH: dict[tuple[str, str], int] = {
+    ("supports", "strong"): 3,
+    ("supports", "moderate"): 2,
+    ("supports", "weak"): 1,
+    ("disputes", "weak"): -1,
+    ("disputes", "moderate"): -2,
+    ("disputes", "strong"): -3,
+}
+
+
+def score_from_stance(stance: str, strength: str | None) -> int:
+    """Derive the signed integer from the categorical pair (spec §4)."""
+    if stance == "silent":
+        if strength:
+            raise ValueError("a silent stance takes no strength")
+        return 0
+    if not strength:
+        raise ValueError(f"stance {stance!r} requires a strength")
+    try:
+        return SCORE_BY_STANCE_STRENGTH[(stance, strength)]
+    except KeyError:
+        raise ValueError(f"no score for stance {stance!r} strength {strength!r}") from None
+
+
 def _grading_prompt(calls: list[CallRecord], responding_models: list[str]) -> str:
     anonymized = []
     for index, model in enumerate(responding_models):
@@ -435,11 +463,17 @@ def _grading_prompt(calls: list[CallRecord], responding_models: list[str]) -> st
             (
                 "Blindly compare these independent research outputs. Return JSON only with this shape: "
                 '{"claims":[{"text":"one declarative proposition","scores":'
-                '[{"model_index":1,"score":-3,"quote":"verbatim span"}]}],'
+                '[{"model_index":1,"stance":"supports","strength":"moderate",'
+                '"quote":"verbatim span"}]}],'
                 '"report_markdown":"report with a What this run does not establish section"}. '
-                "Scores are integers -3..3; 0 means no bearing statement and must have an empty quote. "
-                "Every non-zero score must quote an exact verbatim span. Include the union of material claims. "
-                "Do not identify or rank the model authors."
+                "stance is one of supports, disputes, silent. strength is one of strong, moderate, "
+                "weak, and is given only when the stance is not silent: strong for an unqualified "
+                "assertion, moderate for qualified language or support only in part, weak for a "
+                "passing or heavily hedged mention. Do not return a numeric score -- the number is "
+                "derived from the pair. A silent stance means the output carries no bearing "
+                "statement on the claim, takes no strength, and must have an empty quote; every "
+                "other stance must quote an exact verbatim span. Include the union of material "
+                "claims. Do not identify or rank the model authors."
             ),
             *anonymized,
         ]
@@ -553,22 +587,30 @@ def _claims_and_scores(
         numeric_scores: list[int] = []
         for model_index, model_id in enumerate(responding, start=1):
             row = by_index.get(model_index, {})
-            raw_score = row.get("score", 0)
-            score = int(raw_score) if isinstance(raw_score, int | float | str) else 0
-            if score < SCORE_MIN or score > SCORE_MAX:
-                raise ValueError(
-                    f"score outside {SCORE_MIN}..{SCORE_MAX} for {claim_id}/{model_id}"
-                )
+            # A model the grader said nothing about is silent by omission. That
+            # is a decision, not a default, and it is the same one the previous
+            # numeric contract made by reading a missing score as 0.
+            stance = str(row.get("stance") or "silent").strip().lower()
+            strength_raw = str(row.get("strength") or "").strip().lower() or None
+            if stance not in ("supports", "disputes", "silent"):
+                raise ValueError(f"unknown stance {stance!r} for {claim_id}/{model_id}")
+            try:
+                score = score_from_stance(stance, strength_raw)
+            except ValueError as exc:
+                raise ValueError(f"{exc} for {claim_id}/{model_id}") from None
+            strength = None if stance == "silent" else strength_raw
             quote = str(row.get("quote") or "").strip() or None
-            if score != 0 and not quote:
-                raise ValueError(f"non-zero score has no quote for {claim_id}/{model_id}")
-            if score == 0:
+            if stance != "silent" and not quote:
+                raise ValueError(f"stance {stance!r} has no quote for {claim_id}/{model_id}")
+            if stance == "silent":
                 quote = None
             numeric_scores.append(score)
             scores.append(
                 ScoreRecord(
                     claim_id=claim_id,
                     model_id=model_id,
+                    stance=stance,
+                    strength=strength,
                     score=score,
                     quote=quote,
                     grading_call_id=grading_call_id,
@@ -841,7 +883,15 @@ class CommissionService:
         csv_buffer = io.StringIO()
         writer = csv.DictWriter(
             csv_buffer,
-            fieldnames=["claim_id", "model_id", "score", "quote", "grading_call_id"],
+            fieldnames=[
+                "claim_id",
+                "model_id",
+                "stance",
+                "strength",
+                "score",
+                "quote",
+                "grading_call_id",
+            ],
         )
         writer.writeheader()
         for score in scores:

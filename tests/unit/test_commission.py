@@ -9,13 +9,16 @@ import pytest
 from alexandria.commission import (
     ASSUMED_COMPLETION_TOKENS,
     MAX_COMPLETION_TOKENS,
+    SCORE_BY_STANCE_STRENGTH,
     WEB_SEARCH_COST_USD,
     WEB_SEARCH_PROMPT_TOKENS,
     CommissionError,
     CommissionService,
     OpenRouterGateway,
+    _claims_and_scores,
     _parse_analysis,
     classify_scores,
+    score_from_stance,
 )
 from alexandria.commission_models import Brief, CallRecord
 from alexandria.infrastructure.config import Config
@@ -48,8 +51,13 @@ class FakeGateway:
                         {
                             "text": "The provider port should remain narrow.",
                             "scores": [
-                                {"model_index": 1, "score": 3, "quote": "remain narrow"},
-                                {"model_index": 2, "score": 0, "quote": ""},
+                                {
+                                    "model_index": 1,
+                                    "stance": "supports",
+                                    "strength": "strong",
+                                    "quote": "remain narrow",
+                                },
+                                {"model_index": 2, "stance": "silent", "quote": ""},
                             ],
                         }
                     ],
@@ -106,9 +114,9 @@ class UnescapedQuoteGateway(FakeGateway):
             return call
         body = (
             '{"claims":[{"text":"The provider port should remain narrow.",'
-            '"scores":[{"model_index":1,"score":3,'
+            '"scores":[{"model_index":1,"stance":"supports","strength":"strong",'
             '"quote":"acknowledges \'if the honest answer is "it depends"\' here"},'
-            '{"model_index":2,"score":0,"quote":""}]}],'
+            '{"model_index":2,"stance":"silent","quote":""}]}],'
             '"report_markdown":"# Report\\n\\n## What this run does not establish\\n\\nTruth."}'
         )
         return call.model_copy(update={"body": body})
@@ -447,6 +455,9 @@ async def test_commission_persists_accepted_run_shapes(tmp_path: Path) -> None:
         rows = list(csv.DictReader(stream))
     assert rows[0]["score"] == "3"
     assert rows[1]["score"] == "0"
+    # The pair travels with the score, so the table can be rescored in place.
+    assert (rows[0]["stance"], rows[0]["strength"]) == ("supports", "strong")
+    assert (rows[1]["stance"], rows[1]["strength"]) == ("silent", "")
 
 
 @pytest.mark.anyio
@@ -710,3 +721,98 @@ async def test_search_is_off_unless_asked_for(tmp_path: Path) -> None:
 
     assert draft.web_search is False
     assert draft.web_search_rationale == ""
+
+
+# --- docs/confidence-calibration.md §4: the pair, and the score derived from it
+
+
+def _graded(rows: list[dict[str, Any]]) -> tuple[list[Any], list[Any]]:
+    """Run one claim's grading rows through the real parser."""
+    payload = {"claims": [{"text": "A declarative proposition.", "scores": rows}]}
+    calls = [
+        CallRecord(model_id="a/one", status="success", body="x", latency_ms=1),
+        CallRecord(model_id="b/two", status="success", body="y", latency_ms=1),
+    ]
+    return _claims_and_scores(payload, calls, "gen-1")
+
+
+@pytest.mark.parametrize(
+    ("stance", "strength", "expected"),
+    [
+        ("supports", "strong", 3),
+        ("supports", "moderate", 2),
+        ("supports", "weak", 1),
+        ("silent", None, 0),
+        ("disputes", "weak", -1),
+        ("disputes", "moderate", -2),
+        ("disputes", "strong", -3),
+    ],
+)
+def test_score_is_derived_from_the_pair(stance: str, strength: str | None, expected: int) -> None:
+    assert score_from_stance(stance, strength) == expected
+
+
+def test_the_lookup_covers_every_non_silent_combination() -> None:
+    combinations = {
+        (stance, strength)
+        for stance in ("supports", "disputes")
+        for strength in ("strong", "moderate", "weak")
+    }
+    assert set(SCORE_BY_STANCE_STRENGTH) == combinations
+
+
+def test_a_silent_stance_takes_no_strength() -> None:
+    with pytest.raises(ValueError, match="silent stance takes no strength"):
+        score_from_stance("silent", "weak")
+
+
+def test_a_bearing_stance_requires_a_strength() -> None:
+    with pytest.raises(ValueError, match="requires a strength"):
+        score_from_stance("supports", None)
+
+
+def test_an_unknown_strength_is_refused_rather_than_scored() -> None:
+    with pytest.raises(ValueError, match="no score for stance"):
+        score_from_stance("disputes", "mild")
+
+
+def test_an_unknown_stance_is_refused() -> None:
+    with pytest.raises(ValueError, match="unknown stance"):
+        _graded([{"model_index": 1, "stance": "agrees", "strength": "strong", "quote": "q"}])
+
+
+def test_a_bearing_stance_without_a_quote_is_refused() -> None:
+    with pytest.raises(ValueError, match="has no quote"):
+        _graded([{"model_index": 1, "stance": "supports", "strength": "strong", "quote": ""}])
+
+
+def test_a_silent_stance_keeps_no_quote() -> None:
+    _, scores = _graded([{"model_index": 1, "stance": "silent", "quote": "leftover"}])
+    assert scores[0].score == 0
+    assert scores[0].stance == "silent"
+    assert scores[0].strength is None
+    assert scores[0].quote is None
+
+
+def test_a_model_the_grader_omitted_is_silent_not_missing() -> None:
+    _, scores = _graded(
+        [{"model_index": 1, "stance": "disputes", "strength": "moderate", "quote": "q"}]
+    )
+    assert [(s.model_id, s.score, s.stance) for s in scores] == [
+        ("a/one", -2, "disputes"),
+        ("b/two", 0, "silent"),
+    ]
+
+
+def test_stored_labels_let_a_changed_mapping_be_reapplied_without_regrading() -> None:
+    """The point of storing the pair: rescoring needs no model call.
+
+    This is what no run in the corpus could do before -- scores were integers a
+    model chose, with nothing recorded to recompute them from.
+    """
+    _, scores = _graded(
+        [{"model_index": 1, "stance": "supports", "strength": "weak", "quote": "q"}]
+    )
+    stored = [(s.stance, s.strength) for s in scores if s.stance != "silent"]
+    revised = {("supports", "weak"): 2}
+    assert [revised[pair] for pair in stored] == [2]

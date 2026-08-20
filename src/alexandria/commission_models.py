@@ -122,9 +122,22 @@ class CallRecord(BaseModel):
     truncated: bool = False
 
 
+#: docs/confidence-calibration.md §4. The grader emits the pair; the integer is
+#: a fixed lookup, so a mapping change can be applied to stored runs instead of
+#: re-dispatching them.
+Stance = Literal["supports", "disputes", "silent"]
+Strength = Literal["strong", "moderate", "weak"]
+
+
 class ScoreRecord(BaseModel):
     claim_id: str
     model_id: str
+    #: None only where the model returned no output at all: a failed research
+    #: call has no stance, and must not be coerced to silent.
+    stance: Stance | None = None
+    #: None when the stance is silent, which takes no strength, and when there
+    #: is no stance to qualify.
+    strength: Strength | None = None
     score: int | None
     quote: str | None
     grading_call_id: str | None
