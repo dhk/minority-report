@@ -16,6 +16,58 @@ the registry's `check`/`reconcile` commands to distinguish declared, installed,
 healthy, and stale state. A passing health endpoint is not evidence that provider
 credentials, spend controls, corpus promotion, or publication work.
 
+## Upgrading a host
+
+```
+alexandria-ctl upgrade
+```
+
+That is the whole procedure. It builds the current `main` of *this* repository
+into a release bundle, verifies its checksum, extracts it, installs it, restarts
+the user units, and polls `/health`. No sudo, and safe to re-run: if the
+deployed commit already matches the source it prints `Already current` and stops
+before building anything.
+
+`alexandria-ctl status` names the build that is answering — bundle id and source
+commit, read from the installed distribution's PEP 610 provenance rather than
+from the package version, which never changes. Compare it against
+`git rev-parse --short=12 main` to see whether a host is behind.
+
+**What it refuses, and why.** Deploying the wrong tree is the failure this
+command exists to prevent.
+
+- A source checkout that declares no `alexandria-mcp` / `alexandria-web` /
+  `alexandria-ctl` entry point. The corpus repository is also called
+  `alexandria` at the same version, so the name proves nothing and the entry
+  points are what the units invoke.
+- A tree that is not on `main`, or has uncommitted changes. Pass `--ref <ref>`
+  to deploy something else deliberately, or `--force` to deploy the working tree
+  as it stands.
+
+`ALEXANDRIA_SOURCE` overrides where the tooling is checked out; it defaults to
+`~/src/minority-report`. It is **not** `ALEXANDRIA_REPO`, which names the corpus
+this service reads.
+
+**Why no sudo.** The steps needing root — reserving the service registry entry
+and asserting the tailscale route — only apply to a first install; an upgrade
+re-uses entries already reserved. So this takes `install.py --skip-service` and
+restarts the user units itself. That path skips the installer's service checks,
+which is why this command polls `/health` and says so if the server does not
+come back.
+
+**First install, or changed routing.** Use the bundle directly, which does the
+registry and tailscale work and will ask for a password:
+
+```
+python3 -m scripts.pack --output-dir ~/alexandria-deploy
+cd ~/alexandria-deploy && sha256sum -c <bundle>.sha256
+tar -xzf <bundle>.tar.gz && ./<bundle>/install.py --yes
+```
+
+`--dry-run` prints the plan without touching anything. A failed install rolls
+back on its own: the symlink is reverted, the previous release reinstalled, and
+systemd reloaded.
+
 ## Registry operations
 
 ```text

@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
 import signal
 import subprocess
 import sys
+import tarfile
+import tempfile
 import time
+import tomllib
 import urllib.error
 import urllib.request
 from collections.abc import Callable
@@ -19,7 +23,7 @@ from typing import Any, Protocol, TextIO
 
 from alexandria.infrastructure.config import ENV_REPO_ROOT, RepoNotFoundError, load_config
 from alexandria.infrastructure.research_repo import list_investigations
-from alexandria.version import service_version
+from alexandria.version import deployed_release, deployed_summary
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8797
@@ -377,27 +381,160 @@ def start_server(
     return healthy
 
 
-def upgrade(repo: Path, *, runner: Runner = _run_checked, stream: TextIO = sys.stdout) -> None:
-    if not (repo / ".git").exists():
-        raise RuntimeError(f"Alexandria checkout not found at {repo}; set ALEXANDRIA_REPO.")
-    print(f"→ refreshing {repo} from GitHub…", file=stream)
-    runner(["git", "pull", "--ff-only"], cwd=repo)
-    uv = shutil.which("uv")
-    if uv is None:
-        raise RuntimeError("uv is not installed or is not on PATH.")
-    print("→ reinstalling the uv tool…", file=stream)
-    runner([uv, "tool", "install", "--reinstall", "."], cwd=repo)
+DEFAULT_SOURCE = Path("~/src/minority-report")
+#: Every service unit runs one of these. A source tree that does not declare
+#: them is not this project, whatever its package is called.
+REQUIRED_SCRIPTS = ("alexandria-mcp", "alexandria-web", "alexandria-ctl")
+
+
+def _default_source(env: dict[str, str] | os._Environ[str] | None = None) -> Path:
+    """Where the tooling is checked out.
+
+    Deliberately not ALEXANDRIA_REPO. That names the corpus this service reads,
+    and pointing an install at it is how `upgrade` came to reinstall the tool
+    from a package that declares no executables (#63).
+    """
+    environment = os.environ if env is None else env
+    configured = environment.get("ALEXANDRIA_SOURCE", "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return DEFAULT_SOURCE.expanduser().resolve()
+
+
+def _git(arguments: list[str], cwd: Path) -> str:
+    result = subprocess.run(
+        ["git", *arguments], cwd=cwd, capture_output=True, text=True, check=True
+    )
+    return result.stdout.strip()
+
+
+def assert_installable_source(source: Path) -> None:
+    """Refuse a tree that cannot produce this service.
+
+    The corpus and this repository both declare `name = "alexandria"` at the
+    same version, so a name check proves nothing. The entry points are what
+    differ, and they are what the units invoke.
+    """
+    if not (source / ".git").is_dir():
+        raise RuntimeError(f"{source} is not a git checkout; set ALEXANDRIA_SOURCE.")
+    pyproject = source / "pyproject.toml"
+    if not pyproject.is_file():
+        raise RuntimeError(f"{source} has no pyproject.toml.")
+    declared = tomllib.loads(pyproject.read_text()).get("project", {}).get("scripts", {})
+    missing = [name for name in REQUIRED_SCRIPTS if name not in declared]
+    if missing:
+        raise RuntimeError(
+            f"{source} declares no {', '.join(missing)} entry point(s), so installing it "
+            "would leave the service units pointing at commands that do not exist. "
+            "This is the corpus checkout, not the tooling one (#63)."
+        )
+
+
+def _source_commit(source: Path, ref: str | None, *, force: bool) -> str:
+    """The commit to deploy, refusing anything unintended unless forced."""
+    if ref:
+        return _git(["rev-parse", ref], source)
+    branch = _git(["rev-parse", "--abbrev-ref", "HEAD"], source)
+    dirty = bool(_git(["status", "--porcelain"], source))
+    if not force:
+        if branch != "main":
+            raise RuntimeError(
+                f"{source} is on {branch!r}, not main. Deploying a branch is a decision: "
+                "pass --ref to name it, or --force to deploy this checkout as it stands."
+            )
+        if dirty:
+            raise RuntimeError(f"{source} has uncommitted changes; commit, stash, or --force.")
+    return _git(["rev-parse", "HEAD"], source)
+
+
+def upgrade(
+    source: Path | None = None,
+    *,
+    ref: str | None = None,
+    force: bool = False,
+    restart: bool = True,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+    stream: TextIO = sys.stdout,
+) -> bool:
+    """Build the current source into a release, install it, and restart.
+
+    One command, no sudo. The host wiring that needs root — the service
+    registry and the tailscale route — is re-asserted only on a first install;
+    an upgrade re-uses entries that are already reserved, so this takes
+    install.py's --skip-service path and restarts the user units itself.
+
+    That path also skips install.py's service health checks, so this polls
+    /health afterwards rather than assuming the restart worked.
+    """
+    source = (source or _default_source()).expanduser().resolve()
+    assert_installable_source(source)
+
+    print(f"→ fetching {source}…", file=stream)
+    _git(["fetch", "--quiet", "origin"], source)
+    commit = _source_commit(source, ref, force=force)
+
+    manifest = deployed_release() or {}
+    running = (manifest.get("source") or {}).get("commit")
+    print(f"  running: {deployed_summary()}", file=stream)
+    print(f"  source:  {commit[:12]}", file=stream)
+    if running == commit and not force:
+        print("Already current; nothing to install.", file=stream)
+        return True
+
+    with tempfile.TemporaryDirectory(prefix="alexandria-upgrade-") as workspace:
+        staging = Path(workspace)
+        print("→ building a release bundle…", file=stream)
+        subprocess.run(
+            [sys.executable, "-m", "scripts.pack", "--output-dir", str(staging)],
+            cwd=source,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        archives = sorted(staging.glob("*.tar.gz"))
+        if len(archives) != 1:
+            raise RuntimeError(f"expected one bundle in {staging}, found {len(archives)}")
+        archive = archives[0]
+
+        expected = Path(f"{archive}.sha256").read_text().split()[0]
+        actual = hashlib.sha256(archive.read_bytes()).hexdigest()
+        if expected != actual:
+            raise RuntimeError(f"{archive.name}: checksum mismatch; refusing to install it")
+        print(f"  {archive.name} verified", file=stream)
+
+        with tarfile.open(archive) as bundle:
+            bundle.extractall(staging, filter="data")
+        installer = staging / archive.name[: -len(".tar.gz")] / "install.py"
+        if not installer.is_file():
+            raise RuntimeError(f"bundle contains no install.py at {installer}")
+
+        print("→ installing…", file=stream)
+        subprocess.run(
+            [sys.executable, str(installer), "--yes", "--skip-service"],
+            check=True,
+        )
+
+    if not restart:
+        print("Installed; services not restarted (--no-restart).", file=stream)
+        return True
+
+    print("→ restarting services…", file=stream)
+    stop_all(use_systemd=systemd_unit_installed(), force=True, stream=stream)
+    healthy = start_server(source, host, port, use_systemd=systemd_unit_installed(), stream=stream)
+    print(f"Now serving {deployed_summary()}", file=stream)
+    if not healthy:
+        print(
+            "The server did not come back healthy. The previous release is still under "
+            "releases/; repoint `current` at it and reinstall to go back.",
+            file=stream,
+        )
+    return healthy
 
 
 def cycle(repo: Path, host: str, port: int, *, stream: TextIO = sys.stdout) -> bool:
-    """Upgrade first, then minimize downtime while replacing every same-user server."""
-    managed = systemd_unit_installed()
-    upgrade(repo, stream=stream)
-    print("→ stopping Alexandria MCP servers on the old build…", file=stream)
-    stop_all(use_systemd=managed, force=True, stream=stream)
-    print("→ starting the HTTP server on the new build…", file=stream)
-    healthy = start_server(repo, host, port, use_systemd=managed, stream=stream)
-    print(f"Alexandria {service_version()}", file=stream)
+    """Kept as a name: upgrade now installs and restarts in one pass."""
+    healthy = upgrade(host=host, port=port, stream=stream)
     if healthy:
         print("Cycle complete.", file=stream)
     return healthy
@@ -488,7 +625,7 @@ def _print_status(
     host_env_file: Path | None = None,
     cwd: Path | None = None,
 ) -> None:
-    print(f"Alexandria {service_version()}", file=stream)
+    print(f"Alexandria {deployed_summary()}", file=stream)
     processes = mcp_processes()
     server = next((item for item in processes if item.is_http), None)
     for line in _corpus_lines(env, host_env_file=host_env_file, cwd=cwd, process=server):
@@ -563,7 +700,11 @@ def _print_urls(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="alexandria-ctl")
-    parser.add_argument("--repo", type=Path)
+    parser.add_argument("--repo", type=Path, help="corpus checkout this service reads")
+    parser.add_argument("--source", type=Path, help="tooling checkout to build from")
+    parser.add_argument("--ref", help="git ref to deploy instead of the checked-out main")
+    parser.add_argument("--force", action="store_true", help="deploy a dirty or non-main tree")
+    parser.add_argument("--no-restart", action="store_true", help="install without restarting")
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--tunnel-path", default=None)
@@ -574,7 +715,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         repo = args.repo.expanduser().resolve() if args.repo else None
-        if args.command in {"start", "upgrade", "cycle"} and repo is None:
+        if args.command in {"start", "cycle"} and repo is None:
             repo = _default_repo()
         if args.command == "status":
             _print_status(args.host, args.port)
@@ -602,8 +743,18 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "stop-all":
             stop_all(use_systemd=systemd_unit_installed())
         elif args.command == "upgrade":
-            assert repo is not None
-            upgrade(repo)
+            return (
+                0
+                if upgrade(
+                    args.source,
+                    ref=args.ref,
+                    force=args.force,
+                    restart=not args.no_restart,
+                    host=args.host,
+                    port=args.port,
+                )
+                else 1
+            )
         elif args.command == "cycle":
             assert repo is not None
             return 0 if cycle(repo, args.host, args.port) else 1
