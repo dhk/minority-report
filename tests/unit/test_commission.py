@@ -15,7 +15,8 @@ from alexandria.commission import (
     CommissionError,
     CommissionService,
     OpenRouterGateway,
-    _claims_and_scores,
+    _extracted_claims,
+    _landscape,
     _parse_analysis,
     classify_scores,
     score_from_stance,
@@ -28,6 +29,11 @@ from alexandria.input_resolution import extract_input
 class FakeGateway:
     def __init__(self) -> None:
         self.web_search_by_model: dict[str, bool] = {}
+        self.extraction_prompts: list[str] = []
+        self.graded_prompts: list[str] = []
+        #: Generation ids are per call, not per model — the grader is called
+        #: once per research output now, and each response is its own record.
+        self.calls_made = 0
 
     async def estimate(
         self,
@@ -44,35 +50,53 @@ class FakeGateway:
 
     async def complete(self, model: str, prompt: str, *, web_search: bool = False) -> CallRecord:
         self.web_search_by_model[model] = web_search
+        self.calls_made += 1
         if model == "grader/model":
-            body = json.dumps(
-                {
-                    "claims": [
-                        {
-                            "text": "The provider port should remain narrow.",
-                            "scores": [
-                                {
-                                    "model_index": 1,
-                                    "stance": "supports",
-                                    "strength": "strong",
-                                    "quote": "remain narrow",
-                                },
-                                {"model_index": 2, "stance": "silent", "quote": ""},
-                            ],
-                        }
-                    ],
-                    "report_markdown": "# Report\n\n## What this run does not establish\n\nTruth.",
-                }
-            )
+            # Two passes now: extraction fixes claim identity, then one blind
+            # call per research model. They are told apart the way the real
+            # grader would be — by which prompt it was handed.
+            if "CLAIM LIST" in prompt:
+                self.graded_prompts.append(prompt)
+                supports = "alpha" in prompt
+                body = json.dumps(
+                    {
+                        "scores": [
+                            {
+                                "claim_id": "c-001",
+                                "stance": "supports" if supports else "silent",
+                                **({"strength": "strong"} if supports else {}),
+                                "quote": "remain narrow" if supports else "",
+                            }
+                        ]
+                    }
+                )
+            else:
+                self.extraction_prompts.append(prompt)
+                body = json.dumps(
+                    {
+                        "claims": [
+                            {
+                                "claim_id": "c1",
+                                "claim_text": "The provider port should remain narrow.",
+                            }
+                        ],
+                        "report_markdown": (
+                            "# Report\n\n## What this run does not establish\n\nTruth."
+                        ),
+                    }
+                )
         else:
-            body = "Evidence says the provider port should remain narrow."
+            # The grading prompt never names the model — that is the point of
+            # §3.2 — so a fake grader can only tell outputs apart by what they
+            # say, exactly as a real one would.
+            body = f"Evidence from {model} says the provider port should remain narrow."
         return CallRecord(
             model_id=model,
             resolved_model_id=model + ":resolved",
             status="success",
             body=body,
             raw_response=json.dumps({"model": model, "body": body}),
-            generation_id="gen-" + model.replace("/", "-"),
+            generation_id=f"gen-{model.replace('/', '-')}-{self.calls_made}",
             cost=0.01,
             latency_ms=10,
         )
@@ -440,7 +464,8 @@ async def test_commission_persists_accepted_run_shapes(tmp_path: Path) -> None:
     run_dir = service.store.run_dir(run.run_id)
 
     assert run.status == "completed"
-    assert run.cost_actual == 0.03
+    # Two research calls, then extraction plus one grading call per model.
+    assert run.cost_actual == 0.05
     assert service.store.load_run(run.run_id).run_id == run.run_id
     assert (run_dir / "run.json").is_file()
     assert (run_dir / "claims.json").is_file()
@@ -595,11 +620,13 @@ async def test_cost_json_records_prediction_against_measurement(tmp_path: Path) 
     cost = json.loads((service.store.run_dir(run.run_id) / "cost.json").read_text(encoding="utf-8"))
 
     assert cost["estimate"]["total_usd"] == draft.estimate_usd
-    # Two research calls plus grading, each 0.01 in the fake gateway.
-    assert cost["actual"]["total_usd"] == pytest.approx(0.03)
+    # Two research calls, then grading: one extraction pass plus one blind call
+    # per research model. Five calls at 0.01 in the fake gateway. The grading
+    # figure is the whole pipeline, not the first leg of it.
+    assert cost["actual"]["total_usd"] == pytest.approx(0.05)
     assert cost["actual"]["research_usd"] == pytest.approx(0.02)
-    assert cost["actual"]["grading_usd"] == pytest.approx(0.01)
-    assert cost["actual"]["billed_call_count"] == 3
+    assert cost["actual"]["grading_usd"] == pytest.approx(0.03)
+    assert cost["actual"]["billed_call_count"] == 5
     assert cost["actual"]["failed_call_count"] == 0
     # Both halves must be present, or the pair cannot be fitted later.
     assert cost["estimate"]["assumed_completion_tokens"] == ASSUMED_COMPLETION_TOKENS
@@ -623,7 +650,8 @@ async def test_a_failed_call_is_still_counted_in_the_cost_record(tmp_path: Path)
 
     assert cost["actual"]["failed_call_count"] == 1
     assert cost["actual"]["unpriced_call_count"] == 1
-    assert cost["actual"]["billed_call_count"] == 2
+    # One research call survived, and it is graded by extraction plus one call.
+    assert cost["actual"]["billed_call_count"] == 3
 
 
 @pytest.mark.anyio
@@ -727,13 +755,27 @@ async def test_search_is_off_unless_asked_for(tmp_path: Path) -> None:
 
 
 def _graded(rows: list[dict[str, Any]]) -> tuple[list[Any], list[Any]]:
-    """Run one claim's grading rows through the real parser."""
-    payload = {"claims": [{"text": "A declarative proposition.", "scores": rows}]}
-    calls = [
-        CallRecord(model_id="a/one", status="success", body="x", latency_ms=1),
-        CallRecord(model_id="b/two", status="success", body="y", latency_ms=1),
-    ]
-    return _claims_and_scores(payload, calls, "gen-1")
+    """Assemble one claim from per-model grading responses, through the real code.
+
+    ``rows`` carries the old fused shape's model_index so the existing cases
+    read unchanged; here it selects which model's blind response the row lands
+    in, which is what the topology change actually did to them.
+    """
+    claims = [{"claim_id": "c-001", "claim_text": "A declarative proposition."}]
+    models = ["a/one", "b/two"]
+    calls = [CallRecord(model_id=m, status="success", body="x", latency_ms=1) for m in models]
+    graded: dict[str, tuple[CallRecord, dict[str, Any]]] = {}
+    for index, model in enumerate(models, start=1):
+        mine = [
+            {k: v for k, v in row.items() if k != "model_index"} | {"claim_id": "c-001"}
+            for row in rows
+            if row.get("model_index") == index
+        ]
+        call = CallRecord(
+            model_id=model, status="success", body="x", latency_ms=1, generation_id=f"gen-{index}"
+        )
+        graded[model] = (call, {"scores": mine})
+    return _landscape(claims, graded, calls)
 
 
 @pytest.mark.parametrize(
@@ -816,3 +858,117 @@ def test_stored_labels_let_a_changed_mapping_be_reapplied_without_regrading() ->
     stored = [(s.stance, s.strength) for s in scores if s.stance != "silent"]
     revised = {("supports", "weak"): 2}
     assert [revised[pair] for pair in stored] == [2]
+
+
+# --- docs/confidence-calibration.md §3.1 and §3.2: the topology, not the score
+
+
+@pytest.mark.anyio
+async def test_grading_is_one_blind_call_per_research_model(tmp_path: Path) -> None:
+    """§3.2. The property is what the grader could not see, so assert that."""
+    gateway = FakeGateway()
+    service = CommissionService(_config(tmp_path), gateway)
+    draft = await service.create_draft(
+        Brief(task="Assess the provider port."),
+        [extract_input("brief.md", b"Keep the port narrow.")],
+        ["alpha/model", "beta/model"],
+        "grader/model",
+        1.0,
+    )
+    await service.dispatch(draft.draft_id)
+
+    assert len(gateway.extraction_prompts) == 1
+    assert len(gateway.graded_prompts) == 2
+    for prompt in gateway.graded_prompts:
+        # Exactly one research output is present in each grading prompt. A
+        # grader that has read the other one is the defect this replaces.
+        seen = [model for model in ("alpha/model", "beta/model") if f"from {model}" in prompt]
+        assert len(seen) == 1, seen
+
+
+@pytest.mark.anyio
+async def test_claim_identity_is_fixed_before_any_output_is_scored(tmp_path: Path) -> None:
+    """§3.1. Every grading call scores against the same list, supplied to it."""
+    gateway = FakeGateway()
+    service = CommissionService(_config(tmp_path), gateway)
+    draft = await service.create_draft(
+        Brief(task="Assess the provider port."),
+        [extract_input("brief.md", b"Keep the port narrow.")],
+        ["alpha/model", "beta/model"],
+        "grader/model",
+        1.0,
+    )
+    run = await service.dispatch(draft.draft_id)
+
+    for prompt in gateway.graded_prompts:
+        assert "c-001: The provider port should remain narrow." in prompt
+    # And the extraction pass is not asked to score anything.
+    assert "stance" not in gateway.extraction_prompts[0]
+
+    claims = json.loads((service.store.run_dir(run.run_id) / "claims.json").read_text())
+    assert [c["claim_id"] for c in claims] == ["c-001"]
+
+
+@pytest.mark.anyio
+async def test_every_grading_leg_is_preserved_separately(tmp_path: Path) -> None:
+    gateway = FakeGateway()
+    service = CommissionService(_config(tmp_path), gateway)
+    draft = await service.create_draft(
+        Brief(task="Assess the provider port."),
+        [extract_input("brief.md", b"Keep the port narrow.")],
+        ["alpha/model", "beta/model"],
+        "grader/model",
+        1.0,
+    )
+    run = await service.dispatch(draft.draft_id)
+    raw = service.store.run_dir(run.run_id) / "raw"
+
+    assert (raw / "extraction.json").is_file()
+    assert (raw / "grading-alpha-model.json").is_file()
+    assert (raw / "grading-beta-model.json").is_file()
+    # The scores name the grading call they came from, per model, so a
+    # landscape can be traced back to the exact response that produced it.
+    with (service.store.run_dir(run.run_id) / "scores.csv").open(newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    assert len({row["grading_call_id"] for row in rows}) == 2
+
+
+def test_extraction_renumbers_claims_rather_than_trusting_the_grader() -> None:
+    claims = _extracted_claims(
+        {"claims": [{"claim_id": "x", "claim_text": "One."}, {"claim_id": "x", "text": "Two."}]}
+    )
+    assert [c["claim_id"] for c in claims] == ["c-001", "c-002"]
+
+
+def test_extraction_refuses_a_claim_with_no_text() -> None:
+    with pytest.raises(ValueError, match="no declarative text"):
+        _extracted_claims({"claims": [{"claim_id": "c1", "claim_text": "  "}]})
+
+
+def test_extraction_refuses_an_empty_landscape() -> None:
+    with pytest.raises(ValueError, match="produced no claims"):
+        _extracted_claims({"claims": []})
+
+
+@pytest.mark.anyio
+async def test_the_run_states_its_own_apparatus(tmp_path: Path) -> None:
+    """docs/instrument.md. Written by the code that graded, not by a promoter."""
+    service = CommissionService(_config(tmp_path), FakeGateway())
+    draft = await service.create_draft(
+        Brief(task="Assess the provider port."),
+        [extract_input("brief.md", b"Keep the port narrow.")],
+        ["alpha/model", "beta/model"],
+        "grader/model",
+        1.0,
+    )
+    run = await service.dispatch(draft.draft_id)
+
+    assert run.instrument is not None
+    assert run.instrument.grader_topology == "per-model-blind"
+    assert run.instrument.score_derivation == "derived-lookup"
+    assert run.instrument.extraction_pass == "separate"
+
+    stored = json.loads((service.store.run_dir(run.run_id) / "run.json").read_text())
+    assert stored["instrument"]["grader_topology"] == "per-model-blind"
+    # Conformance is derived at read time, never stored (docs/instrument.md §3).
+    assert "conforming" not in stored["instrument"]

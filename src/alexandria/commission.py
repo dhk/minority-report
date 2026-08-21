@@ -26,6 +26,7 @@ from alexandria.commission_models import (
     CostEstimate,
     Draft,
     InputArtifact,
+    Instrument,
     RunRecord,
     ScoreRecord,
     Stance,
@@ -380,25 +381,29 @@ def _sum_optional(values: list[int | None]) -> int | None:
     return sum(known) if known else None
 
 
-def _cost_actual(calls: list[CallRecord], grading_call: CallRecord | None) -> CostActual:
+def _cost_actual(calls: list[CallRecord], grading_calls: list[CallRecord]) -> CostActual:
     """Measure what a run really cost, in the same shape as its estimate.
 
     Every dispatched call counts, including the ones that failed: a model that
     errored after billable output still spent money, and dropping it here is
     exactly how an overrun stays invisible.
+
+    Grading is a list now, not one call: the spec's topology is an extraction
+    pass plus one call per research model, so a single grading figure would be
+    reporting a fraction of what grading cost.
     """
-    every_call = [call for call in [*calls, grading_call] if call is not None]
+    every_call = [*calls, *grading_calls]
     research_costs = [call.cost for call in calls if call.cost is not None]
-    grading_cost = grading_call.cost if grading_call else None
+    grading_costs = [call.cost for call in grading_calls if call.cost is not None]
     totals = [call.cost for call in every_call if call.cost is not None]
     return CostActual(
         research_usd=round(sum(research_costs), 6) if research_costs else None,
-        grading_usd=grading_cost,
+        grading_usd=round(sum(grading_costs), 6) if grading_costs else None,
         total_usd=round(sum(totals), 6) if totals else None,
         research_prompt_tokens=_sum_optional([call.prompt_tokens for call in calls]),
         research_completion_tokens=_sum_optional([call.completion_tokens for call in calls]),
-        grading_prompt_tokens=grading_call.prompt_tokens if grading_call else None,
-        grading_completion_tokens=grading_call.completion_tokens if grading_call else None,
+        grading_prompt_tokens=_sum_optional([call.prompt_tokens for call in grading_calls]),
+        grading_completion_tokens=_sum_optional([call.completion_tokens for call in grading_calls]),
         billed_call_count=len(totals),
         failed_call_count=sum(1 for call in every_call if call.status == "failed"),
         unpriced_call_count=sum(1 for call in every_call if call.cost is None),
@@ -457,31 +462,78 @@ def score_from_stance(stance: str, strength: str | None) -> int:
         raise ValueError(f"no score for stance {stance!r} strength {strength!r}") from None
 
 
-def _grading_prompt(calls: list[CallRecord], responding_models: list[str]) -> str:
-    anonymized = []
-    for index, model in enumerate(responding_models):
-        call = next(call for call in calls if call.model_id == model)
-        anonymized.append(f"MODEL {index + 1}\n---\n{call.body}\n---")
+def _extraction_prompt(calls: list[CallRecord]) -> str:
+    """Spec §3.1: fix claim identity across the union, before anything is scored.
+
+    This pass sees every output, which is what makes it the right place for the
+    comparative report too. Reading everything is a problem for *scoring* — it
+    anchors one model's judgement on another's framing — and not for deciding
+    what was claimed or for narrating the result.
+    """
+    outputs = [f"MODEL {index + 1}\n---\n{call.body}\n---" for index, call in enumerate(calls)]
     return "\n\n".join(
         [
             (
-                "Blindly compare these independent research outputs. Return JSON only with this shape: "
-                '{"claims":[{"text":"one declarative proposition","scores":'
-                '[{"model_index":1,"stance":"supports","strength":"moderate",'
-                '"quote":"verbatim span"}]}],'
+                "Read these independent research outputs and produce the deduplicated canonical "
+                "claim list, plus a comparative report. Return JSON only with this shape: "
+                '{"claims":[{"claim_id":"c1","claim_text":"one declarative proposition"}],'
                 '"report_markdown":"report with a What this run does not establish section"}. '
-                "stance is one of supports, disputes, silent. strength is one of strong, moderate, "
-                "weak, and is given only when the stance is not silent: strong for an unqualified "
-                "assertion, moderate for qualified language or support only in part, weak for a "
-                "passing or heavily hedged mention. Do not return a numeric score -- the number is "
-                "derived from the pair. A silent stance means the output carries no bearing "
-                "statement on the claim, takes no strength, and must have an empty quote; every "
-                "other stance must quote an exact verbatim span. Include the union of material "
-                "claims. Do not identify or rank the model authors."
+                "Be permissive about claim identity: if even one output treats something as a "
+                "distinct claim it gets its own claim_id — novelty is signal, not noise to be "
+                "merged away. Do not score anything here; scoring happens separately, against "
+                "each output on its own. Do not identify or rank the model authors."
             ),
-            *anonymized,
+            *outputs,
         ]
     )
+
+
+def _model_grading_prompt(claims: list[dict[str, str]], call: CallRecord) -> str:
+    """Spec §3.2: one call per research model, seeing only that model's output."""
+    listing = "\n".join(f"{claim['claim_id']}: {claim['claim_text']}" for claim in claims)
+    return "\n\n".join(
+        [
+            (
+                "Score ONE research output against a fixed claim list. You can see only this "
+                "output; you do not know what any other output said, and you must not guess. "
+                "Return JSON only with this shape: "
+                '{"scores":[{"claim_id":"c1","stance":"supports","strength":"moderate",'
+                '"quote":"verbatim span"}]}. '
+                "Return exactly one entry per claim_id below. stance is one of supports, "
+                "disputes, silent. strength is one of strong, moderate, weak, and is given only "
+                "when the stance is not silent: strong for an unqualified assertion, moderate "
+                "for qualified language or support only in part, weak for a passing or heavily "
+                "hedged mention. Do not return a numeric score — the number is derived from the "
+                "pair. A silent stance means this output carries no bearing statement on the "
+                "claim, takes no strength, and must have an empty quote; every other stance "
+                "must quote an exact verbatim span from the output below. Score only what is "
+                "written, never what the author would presumably say."
+            ),
+            "CLAIM LIST\n---\n" + listing + "\n---",
+            "RESEARCH OUTPUT\n---\n" + (call.body or "") + "\n---",
+        ]
+    )
+
+
+def _extracted_claims(payload: dict[str, Any]) -> list[dict[str, str]]:
+    """Canonical claim list from the extraction pass, ids assigned here.
+
+    The grader's own claim_id is not trusted as an identifier — it only has to
+    be unique within its own response. Renumbering here means a duplicate or a
+    missing id cannot silently merge two claims into one.
+    """
+    raw = payload.get("claims")
+    if not isinstance(raw, list):
+        raise TypeError("extraction response has no claims list")
+    claims: list[dict[str, str]] = []
+    for index, item in enumerate(raw, start=1):
+        text = str((item or {}).get("claim_text") or (item or {}).get("text") or "").strip()
+        if not text:
+            raise ValueError("extraction produced a claim with no declarative text")
+        claims.append({"claim_id": f"c-{index:03d}", "claim_text": text})
+    if not claims:
+        raise ValueError("extraction produced no claims")
+    return claims
 
 
 def _parse_json_object(text: str) -> dict[str, Any]:
@@ -565,35 +617,38 @@ def _parse_analysis(body: str) -> tuple[dict[str, Any], int]:
         return parsed, repairs
 
 
-def _claims_and_scores(
-    payload: dict[str, Any], calls: list[CallRecord], grading_call_id: str | None
+def _landscape(
+    claims: list[dict[str, str]],
+    graded: dict[str, tuple[CallRecord, dict[str, Any]]],
+    calls: list[CallRecord],
 ) -> tuple[list[ClaimRecord], list[ScoreRecord]]:
+    """Assemble the landscape from one blind grading response per model.
+
+    Claim identity comes from the extraction pass and is fixed before any of
+    this runs, so a model's grading response can only fill cells — it cannot
+    add, drop, or merge a claim. That is the separation §3.1 buys.
+    """
     responding = [call.model_id for call in calls if call.status == "success"]
     failed = [call.model_id for call in calls if call.status == "failed"]
-    raw_claims = payload.get("claims")
-    if not isinstance(raw_claims, list):
-        raise TypeError("analysis response has no claims list")
-    claims: list[ClaimRecord] = []
+    claim_records: list[ClaimRecord] = []
     scores: list[ScoreRecord] = []
-    for claim_index, raw_claim in enumerate(raw_claims, start=1):
-        if not isinstance(raw_claim, dict) or not str(raw_claim.get("text") or "").strip():
-            raise ValueError("analysis claim is missing declarative text")
-        claim_id = f"c-{claim_index:03d}"
-        rows = raw_claim.get("scores")
-        rows = rows if isinstance(rows, list) else []
-        by_index: dict[int, dict[str, Any]] = {}
-        for candidate in rows:
-            if not isinstance(candidate, dict):
-                continue
-            candidate_index = candidate.get("model_index")
-            if isinstance(candidate_index, int):
-                by_index[candidate_index] = candidate
+
+    for claim in claims:
+        claim_id = claim["claim_id"]
         numeric_scores: list[int] = []
-        for model_index, model_id in enumerate(responding, start=1):
-            row = by_index.get(model_index, {})
-            # A model the grader said nothing about is silent by omission. That
-            # is a decision, not a default, and it is the same one the previous
-            # numeric contract made by reading a missing score as 0.
+        for model_id in responding:
+            call, payload = graded[model_id]
+            rows = payload.get("scores")
+            by_claim = {
+                str(row.get("claim_id")): row
+                for row in (rows if isinstance(rows, list) else [])
+                if isinstance(row, dict)
+            }
+            # A claim this model's response did not mention is silent by
+            # omission: the grader saw the claim in its list and returned
+            # nothing bearing on it. Same reading the fused contract gave a
+            # missing score of 0, made explicit.
+            row = by_claim.get(claim_id, {})
             stance_text = str(row.get("stance") or "silent").strip().lower()
             strength_text = str(row.get("strength") or "").strip().lower() or None
             if stance_text not in STANCES:
@@ -602,12 +657,9 @@ def _claims_and_scores(
                 score = score_from_stance(stance_text, strength_text)
             except ValueError as exc:
                 raise ValueError(f"{exc} for {claim_id}/{model_id}") from None
-            # Both are checked above -- stance against STANCES, strength by the
-            # lookup that produced the score -- so the narrowing is a statement
-            # about what has been validated, not an assumption about the model.
             stance = cast(Stance, stance_text)
             strength = None if stance == "silent" else cast(Strength, strength_text)
-            quote = str(row.get("quote") or "").strip() or None
+            quote = str(row.get("quote") or row.get("evidence_quote") or "").strip() or None
             if stance != "silent" and not quote:
                 raise ValueError(f"stance {stance!r} has no quote for {claim_id}/{model_id}")
             if stance == "silent":
@@ -621,7 +673,7 @@ def _claims_and_scores(
                     strength=strength,
                     score=score,
                     quote=quote,
-                    grading_call_id=grading_call_id,
+                    grading_call_id=call.generation_id,
                 )
             )
         scores.extend(
@@ -634,15 +686,15 @@ def _claims_and_scores(
             )
             for model_id in failed
         )
-        claims.append(
+        claim_records.append(
             ClaimRecord(
                 claim_id=claim_id,
-                text=str(raw_claim["text"]).strip(),
+                text=claim["claim_text"],
                 group=classify_scores(numeric_scores, len(responding)),
                 responding_model_count=len(responding),
             )
         )
-    return claims, scores
+    return claim_records, scores
 
 
 class CommissionService:
@@ -786,6 +838,12 @@ class CommissionService:
             dispatched_models=draft.models,
             grading_model=draft.grading_model,
             web_search=draft.web_search,
+            # Recorded by the code that will do the grading, before it does it.
+            instrument=Instrument(
+                grader_topology="per-model-blind",
+                score_derivation="derived-lookup",
+                extraction_pass="separate",
+            ),
         )
         run_dir = self.store.run_dir(run_id)
         self.store.write_run(run)
@@ -835,7 +893,7 @@ class CommissionService:
             )
         claims: list[ClaimRecord] = []
         scores: list[ScoreRecord] = []
-        grading_call: CallRecord | None = None
+        grading_calls: list[CallRecord] = []
         report = "# Result\n\n## What this run does not establish\n\nModel agreement is not verification.\n"
         # The research calls are away and billed; grading is the one decision
         # still open, so it is where a ceiling can still bite. Web search makes
@@ -845,43 +903,79 @@ class CommissionService:
         spent = sum(call.cost or 0.0 for call in calls)
         if successful and spent >= draft.ceiling_usd:
             limitations.append(
-                f"The grading call was not made: research already spent ${spent:.4f} of the "
+                f"Grading was not attempted: research already spent ${spent:.4f} of the "
                 f"${draft.ceiling_usd:.4f} ceiling. The research outputs are preserved and can "
                 "be graded by re-running with a higher ceiling; no claim landscape exists yet."
             )
             successful = []
         if successful:
-            grading_call = await self.gateway.complete(
-                draft.grading_model,
-                _grading_prompt(calls, [call.model_id for call in successful]),
+            # Spec §3.1. Claim identity is fixed here, across the union of
+            # outputs, before any output is scored against it.
+            extraction = await self.gateway.complete(
+                draft.grading_model, _extraction_prompt(successful)
             )
+            grading_calls.append(extraction)
             _write_atomic(
-                run_dir / "raw" / "grading.json",
-                _json_bytes(grading_call.model_dump(mode="json")),
+                run_dir / "raw" / "extraction.json",
+                _json_bytes(extraction.model_dump(mode="json")),
             )
-            if grading_call.truncated:
-                # Named separately from the parse error it will almost
-                # certainly cause: "the grader ran out of room" and "the
-                # grader emitted bad JSON" call for different fixes.
+            if extraction.truncated:
                 limitations.append(
-                    f"The grading call was cut off at the {MAX_COMPLETION_TOKENS:,}-token cap; "
-                    "a claim landscape parsed from it, if any, is incomplete."
+                    f"The extraction call was cut off at the {MAX_COMPLETION_TOKENS:,}-token "
+                    "cap; the claim list it produced, if any, is incomplete."
                 )
-            if grading_call.status == "success" and grading_call.body:
+            if extraction.status == "success" and extraction.body:
                 try:
-                    analysis, repairs = _parse_analysis(grading_call.body)
+                    payload, repairs = _parse_analysis(extraction.body)
                     if repairs:
                         limitations.append(
-                            f"The grading response was not valid JSON; {repairs} unescaped "
+                            f"The extraction response was not valid JSON; {repairs} unescaped "
                             "quote(s) inside quoted spans were escaped so it could be read. "
-                            "The raw response is kept verbatim in raw/grading.json."
+                            "The raw response is kept verbatim in raw/extraction.json."
                         )
-                    claims, scores = _claims_and_scores(analysis, calls, grading_call.generation_id)
-                    report = str(analysis.get("report_markdown") or report)
-                except (ValueError, TypeError, KeyError) as exc:
+                    claim_list = _extracted_claims(payload)
+                    report = str(payload.get("report_markdown") or report)
+
+                    # Spec §3.2. One call per research model, each seeing only
+                    # that model's output. Independence at dispatch does not
+                    # survive a grader that has read everything.
+                    graded: dict[str, tuple[CallRecord, dict[str, Any]]] = {}
+                    for call in successful:
+                        spent = sum(billed.cost or 0.0 for billed in [*calls, *grading_calls])
+                        if spent >= draft.ceiling_usd:
+                            raise CommissionError(
+                                f"grading stopped at ${spent:.4f}, the ${draft.ceiling_usd:.4f} "
+                                f"ceiling, with {len(successful) - len(graded)} model(s) ungraded"
+                            )
+                        graded_call = await self.gateway.complete(
+                            draft.grading_model, _model_grading_prompt(claim_list, call)
+                        )
+                        grading_calls.append(graded_call)
+                        _write_atomic(
+                            run_dir / "raw" / f"grading-{_safe_model_name(call.model_id)}.json",
+                            _json_bytes(graded_call.model_dump(mode="json")),
+                        )
+                        if graded_call.truncated:
+                            limitations.append(
+                                f"Grading of {call.model_id} was cut off at the "
+                                f"{MAX_COMPLETION_TOKENS:,}-token cap; its scores are incomplete."
+                            )
+                        if graded_call.status != "success" or not graded_call.body:
+                            raise ValueError(f"the grading call for {call.model_id} failed")
+                        model_payload, model_repairs = _parse_analysis(graded_call.body)
+                        if model_repairs:
+                            limitations.append(
+                                f"The grading response for {call.model_id} was not valid JSON; "
+                                f"{model_repairs} unescaped quote(s) were escaped so it could "
+                                "be read. The raw response is kept verbatim."
+                            )
+                        graded[call.model_id] = (graded_call, model_payload)
+
+                    claims, scores = _landscape(claim_list, graded, calls)
+                except (ValueError, TypeError, KeyError, CommissionError) as exc:
                     limitations.append(f"Grading output could not be validated: {exc}")
             else:
-                limitations.append("The grading call failed; no claim landscape is available.")
+                limitations.append("The extraction call failed; no claim landscape is available.")
         else:
             limitations.append("Every research call failed; no claim landscape is available.")
 
@@ -908,7 +1002,7 @@ class CommissionService:
         _write_atomic(run_dir / "report.md", (report.rstrip() + "\n").encode())
 
         completed = datetime.now(UTC)
-        actual = _cost_actual(calls, grading_call)
+        actual = _cost_actual(calls, grading_calls)
         # Predicted and measured, side by side and per component. One run cannot
         # correct the estimate; a corpus of these can (dhk/alexandria#32).
         _write_atomic(
@@ -927,10 +1021,15 @@ class CommissionService:
                 }
             ),
         )
-        known_costs = [
-            call.cost for call in [*calls, grading_call] if call and call.cost is not None
-        ]
-        grading_ok = grading_call is not None and grading_call.status == "success" and bool(claims)
+        known_costs = [call.cost for call in [*calls, *grading_calls] if call.cost is not None]
+        # Grading is a pipeline now: every leg has to have succeeded, and it has
+        # to have produced a landscape. One failed per-model call is a partial
+        # run, not a complete one with a smaller panel.
+        grading_ok = (
+            bool(grading_calls)
+            and bool(claims)
+            and all(call.status == "success" for call in grading_calls)
+        )
         if not successful:
             status = "failed"
         elif len(successful) != len(calls) or not grading_ok:
@@ -956,7 +1055,7 @@ class CommissionService:
                 call.model_id: call.resolved_model_id for call in calls if call.resolved_model_id
             },
             "generation_ids": [
-                call.generation_id for call in [*calls, grading_call] if call and call.generation_id
+                call.generation_id for call in [*calls, *grading_calls] if call.generation_id
             ],
             "extraction_method": {item.name: item.extraction_method for item in draft.inputs},
             "redispatched_models": [],
