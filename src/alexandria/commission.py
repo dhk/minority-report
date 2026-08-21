@@ -13,7 +13,7 @@ import time
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Protocol, Self
+from typing import Any, Protocol, Self, cast
 
 import httpx
 
@@ -28,6 +28,8 @@ from alexandria.commission_models import (
     InputArtifact,
     RunRecord,
     ScoreRecord,
+    Stance,
+    Strength,
 )
 from alexandria.infrastructure.config import Config
 
@@ -429,6 +431,8 @@ def _research_prompt(brief: Brief, inputs: list[InputArtifact]) -> str:
 #: it emits (stance, strength) and this table produces the integer. Storing the
 #: pair is what makes a mapping change re-appliable to runs already banked --
 #: before this, no score in the corpus could be recomputed without re-grading.
+STANCES: tuple[str, ...] = ("supports", "disputes", "silent")
+
 SCORE_BY_STANCE_STRENGTH: dict[tuple[str, str], int] = {
     ("supports", "strong"): 3,
     ("supports", "moderate"): 2,
@@ -590,15 +594,19 @@ def _claims_and_scores(
             # A model the grader said nothing about is silent by omission. That
             # is a decision, not a default, and it is the same one the previous
             # numeric contract made by reading a missing score as 0.
-            stance = str(row.get("stance") or "silent").strip().lower()
-            strength_raw = str(row.get("strength") or "").strip().lower() or None
-            if stance not in ("supports", "disputes", "silent"):
-                raise ValueError(f"unknown stance {stance!r} for {claim_id}/{model_id}")
+            stance_text = str(row.get("stance") or "silent").strip().lower()
+            strength_text = str(row.get("strength") or "").strip().lower() or None
+            if stance_text not in STANCES:
+                raise ValueError(f"unknown stance {stance_text!r} for {claim_id}/{model_id}")
             try:
-                score = score_from_stance(stance, strength_raw)
+                score = score_from_stance(stance_text, strength_text)
             except ValueError as exc:
                 raise ValueError(f"{exc} for {claim_id}/{model_id}") from None
-            strength = None if stance == "silent" else strength_raw
+            # Both are checked above -- stance against STANCES, strength by the
+            # lookup that produced the score -- so the narrowing is a statement
+            # about what has been validated, not an assumption about the model.
+            stance = cast(Stance, stance_text)
+            strength = None if stance == "silent" else cast(Strength, strength_text)
             quote = str(row.get("quote") or "").strip() or None
             if stance != "silent" and not quote:
                 raise ValueError(f"stance {stance!r} has no quote for {claim_id}/{model_id}")
