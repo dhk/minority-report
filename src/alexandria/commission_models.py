@@ -150,6 +150,26 @@ class ClaimRecord(BaseModel):
     responding_model_count: int
 
 
+class Instrument(BaseModel):
+    """What apparatus produced a run's claim landscape.
+
+    Facts only. Whether the run conforms to the calibration spec is derived
+    from these at read time and deliberately not stored — the same rule the
+    spec applies to a score, and for the same reason: a stored `conforming:
+    true` is a value someone chose rather than a value anyone can check.
+
+    Written by the code that did the grading. Until now the corpus carried this
+    block only because a person added it at promotion time, which meant a run
+    could be graded one way and described another.
+    """
+
+    spec_version: Literal["confidence-calibration/draft-v1"] = "confidence-calibration/draft-v1"
+    grader_topology: Literal["per-model-blind", "single-call-all-models"]
+    score_derivation: Literal["derived-lookup", "model-assigned"]
+    extraction_pass: Literal["separate", "fused"]
+    note: str | None = None
+
+
 class RunRecord(BaseModel):
     run_id: str
     brief_revision: str
@@ -164,4 +184,5 @@ class RunRecord(BaseModel):
     dispatched_models: list[str]
     grading_model: str
     web_search: bool = False
+    instrument: Instrument | None = None
     limitations: list[str] = Field(default_factory=list)
