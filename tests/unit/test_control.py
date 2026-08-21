@@ -1,7 +1,6 @@
 import io
 import json
 import os
-import shutil
 from pathlib import Path
 
 import pytest
@@ -415,80 +414,101 @@ def test_parse_processes_and_filter_same_user(monkeypatch: pytest.MonkeyPatch) -
     assert found[1].is_http is False
 
 
-def test_upgrade_pulls_then_reinstalls(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    (tmp_path / ".git").mkdir()
-    calls: list[tuple[list[str], Path | None]] = []
-
-    def runner(command: list[str], *, cwd: Path | None = None) -> None:
-        calls.append((command, cwd))
-
-    monkeypatch.setattr(shutil, "which", lambda name: "/tools/uv" if name == "uv" else None)
-
-    control.upgrade(tmp_path, runner=runner, stream=io.StringIO())
-
-    assert calls == [
-        (["git", "pull", "--ff-only"], tmp_path),
-        (["/tools/uv", "tool", "install", "--reinstall", "."], tmp_path),
-    ]
-
-
-def test_upgrade_failure_happens_before_process_stop(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    events: list[str] = []
-
-    def fail_upgrade(repo: Path, *, stream: object) -> None:
-        events.append("upgrade")
-        raise RuntimeError("pull failed")
-
-    monkeypatch.setattr(control, "systemd_unit_installed", lambda: False)
-    monkeypatch.setattr(control, "upgrade", fail_upgrade)
-    monkeypatch.setattr(
-        control,
-        "stop_all",
-        lambda **_kwargs: events.append("stop"),
+def _checkout(root: Path, scripts: dict[str, str]) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / ".git").mkdir()
+    body = "\n".join(f'{name} = "{target}"' for name, target in scripts.items())
+    (root / "pyproject.toml").write_text(
+        '[project]\nname = "alexandria"\nversion = "0.1.0"\n\n[project.scripts]\n' + body + "\n"
     )
-
-    with pytest.raises(RuntimeError, match="pull failed"):
-        control.cycle(tmp_path, "127.0.0.1", 8797, stream=io.StringIO())
-
-    assert events == ["upgrade"]
+    return root
 
 
-def test_cycle_orders_upgrade_stop_start_and_health(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_upgrade_refuses_the_corpus_checkout(tmp_path: Path) -> None:
+    """The corpus declares the same package name and no entry points (#63)."""
+    corpus = tmp_path / "alexandria-corpus"
+    corpus.mkdir()
+    (corpus / ".git").mkdir()
+    (corpus / "pyproject.toml").write_text('[project]\nname = "alexandria"\nversion = "0.1.0"\n')
+
+    with pytest.raises(RuntimeError, match="alexandria-mcp"):
+        control.assert_installable_source(corpus)
+
+
+def test_upgrade_accepts_the_tooling_checkout(tmp_path: Path) -> None:
+    source = _checkout(
+        tmp_path / "minority-report",
+        {
+            "alexandria-mcp": "alexandria.mcp_server:main",
+            "alexandria-web": "alexandria.web:main",
+            "alexandria-ctl": "alexandria.control:main",
+        },
+    )
+    control.assert_installable_source(source)
+
+
+def test_upgrade_refuses_a_tree_that_is_not_a_checkout(tmp_path: Path) -> None:
+    with pytest.raises(RuntimeError, match="not a git checkout"):
+        control.assert_installable_source(tmp_path)
+
+
+def test_deploying_a_branch_is_a_decision(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(control, "_git", lambda args, cwd: _fake_git(args, branch="feat/x"))
+    with pytest.raises(RuntimeError, match="not main"):
+        control._source_commit(tmp_path, None, force=False)
+    # named explicitly, it is allowed
+    assert control._source_commit(tmp_path, "feat/x", force=False) == "abc123def456"
+
+
+def test_a_dirty_tree_is_refused(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(control, "_git", lambda args, cwd: _fake_git(args, dirty=True))
+    with pytest.raises(RuntimeError, match="uncommitted changes"):
+        control._source_commit(tmp_path, None, force=False)
+    assert control._source_commit(tmp_path, None, force=True) == "abc123def456"
+
+
+def _fake_git(arguments: list[str], *, branch: str = "main", dirty: bool = False) -> str:
+    if arguments[:2] == ["rev-parse", "--abbrev-ref"]:
+        return branch
+    if arguments[0] == "status":
+        return " M src/alexandria/control.py" if dirty else ""
+    if arguments[0] == "rev-parse":
+        return "abc123def456"
+    return ""
+
+
+def test_upgrade_stops_when_the_deployed_commit_already_matches(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    events: list[str] = []
+    source = _checkout(tmp_path / "src", {name: "x:main" for name in control.REQUIRED_SCRIPTS})
+    monkeypatch.setattr(control, "_git", lambda args, cwd: _fake_git(args))
+    monkeypatch.setattr(control, "deployed_release", lambda: {"source": {"commit": "abc123def456"}})
+    monkeypatch.setattr(control, "deployed_summary", lambda: "0.1.0-abc123def456-x")
+    called: list[str] = []
+    monkeypatch.setattr(control, "stop_all", lambda **_k: called.append("stop"))
 
-    def fake_upgrade(repo: Path, *, stream: object) -> None:
-        assert repo == tmp_path
-        events.append("upgrade")
+    stream = io.StringIO()
+    assert control.upgrade(source, stream=stream) is True
+    assert "Already current" in stream.getvalue()
+    assert called == []
 
-    def fake_stop_all(*, use_systemd: bool, force: bool, stream: object) -> int:
-        assert use_systemd is True
-        assert force is True
-        events.append("stop")
-        return 2
 
-    def fake_start(
-        repo: Path,
-        host: str,
-        port: int,
-        *,
-        use_systemd: bool,
-        stream: object,
-    ) -> bool:
-        assert (repo, host, port, use_systemd) == (tmp_path, "127.0.0.1", 8797, True)
-        events.append("start-and-health")
+def test_ALEXANDRIA_SOURCE_is_not_the_corpus_variable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ALEXANDRIA_REPO names the corpus; using it to install is the #63 defect."""
+    assert control._default_source({"ALEXANDRIA_SOURCE": "/srv/tooling"}) == Path("/srv/tooling")
+    assert control._default_source({"ALEXANDRIA_REPO": "/srv/corpus"}) != Path("/srv/corpus")
+
+
+def test_cycle_delegates_to_upgrade(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    seen: list[tuple[str, int]] = []
+
+    def fake_upgrade(*, host: str, port: int, stream: object) -> bool:
+        seen.append((host, port))
         return True
 
-    monkeypatch.setattr(control, "systemd_unit_installed", lambda: True)
     monkeypatch.setattr(control, "upgrade", fake_upgrade)
-    monkeypatch.setattr(control, "stop_all", fake_stop_all)
-    monkeypatch.setattr(control, "start_server", fake_start)
-
     assert control.cycle(tmp_path, "127.0.0.1", 8797, stream=io.StringIO()) is True
-    assert events == ["upgrade", "stop", "start-and-health"]
+    assert seen == [("127.0.0.1", 8797)]
 
 
 def test_process_match_requires_executable_token() -> None:
