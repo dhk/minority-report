@@ -484,6 +484,10 @@ def test_upgrade_stops_when_the_deployed_commit_already_matches(
     monkeypatch.setattr(control, "_git", lambda args, cwd: _fake_git(args))
     monkeypatch.setattr(control, "deployed_release", lambda: {"source": {"commit": "abc123def456"}})
     monkeypatch.setattr(control, "deployed_summary", lambda: "0.1.0-abc123def456-x")
+    # The server is the authority on what is running; here it agrees.
+    monkeypatch.setattr(
+        control, "served_build", lambda host, port: "0.1.0-abc123def456-x from abc123def456"
+    )
     called: list[str] = []
     monkeypatch.setattr(control, "stop_all", lambda **_k: called.append("stop"))
 
@@ -547,3 +551,25 @@ def test_stop_all_refuses_client_processes_without_confirmation(
     assert result == 0
     assert stopped == []
     assert "aborted" in output.getvalue()
+
+
+def test_the_server_is_asked_what_it_is_running(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """deployed_summary() describes the caller; only /health describes the service."""
+    source = _checkout(tmp_path / "src", {name: "x:main" for name in control.REQUIRED_SCRIPTS})
+    monkeypatch.setattr(control, "_git", lambda args, cwd: _fake_git(args))
+    # This process is a checkout, not the installed tool -- the old failure mode.
+    monkeypatch.setattr(control, "deployed_release", lambda: None)
+    monkeypatch.setattr(control, "deployed_summary", lambda: "0.1.0 (not a pack install)")
+    monkeypatch.setattr(
+        control, "served_build", lambda host, port: "0.1.0-abc123def456-z from abc123def456"
+    )
+    called: list[str] = []
+    monkeypatch.setattr(control, "stop_all", lambda **_k: called.append("stop"))
+
+    stream = io.StringIO()
+    assert control.upgrade(source, stream=stream) is True
+    assert "Already current" in stream.getvalue()
+    assert "not a pack install" not in stream.getvalue()
+    assert called == []
