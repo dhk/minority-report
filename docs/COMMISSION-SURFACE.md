@@ -11,8 +11,11 @@ uv sync --frozen
 uv run alexandria-web
 ```
 
-Open `http://127.0.0.1:8042`. Use `--host` and `--port` only when you understand
-the exposure; the default is loopback. `OPENROUTER_API_KEY` is resolved from the
+Open `http://127.0.0.1:8798`. Use `--host` and `--port` only when you understand
+the exposure; the default is loopback. Both also read from the environment —
+`ALEXANDRIA_WEB_HOST` and `ALEXANDRIA_WEB_PORT` — which is the form a systemd
+unit or container wants. (The MCP server's `--http` port is separate and
+defaults to 8797.) `OPENROUTER_API_KEY` is resolved from the
 process environment or the local secrets file selected by
 `ALEXANDRIA_SECRETS_FILE`.
 

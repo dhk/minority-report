@@ -39,7 +39,7 @@ uv run alexandria-web
 ```
 
 The MCP command defaults to stdio. The web command binds to loopback at
-`http://127.0.0.1:8042`. Provider dispatch incurs external spend and requires the
+`http://127.0.0.1:8798`. Provider dispatch incurs external spend and requires the
 review/confirmation boundary described in the operational docs.
 
 ## Documentation
