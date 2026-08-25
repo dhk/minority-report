@@ -11,7 +11,12 @@ from pathlib import Path
 import pytest
 
 from alexandria import background
-from alexandria.commission import CommissionError, CommissionService, RunStore
+from alexandria.commission import (
+    ASSUMED_COMPLETION_TOKENS,
+    CommissionError,
+    CommissionService,
+    RunStore,
+)
 from alexandria.commission_models import Brief, CallRecord
 from alexandria.infrastructure.config import Config
 from alexandria.input_resolution import extract_input
@@ -24,7 +29,12 @@ class FakeGateway:
     it from another test module gives mypy two names for one file."""
 
     async def estimate(
-        self, models: list[str], input_tokens: int, *, web_search: bool = False
+        self,
+        models: list[str],
+        input_tokens: int,
+        *,
+        web_search: bool = False,
+        completion_tokens: int = ASSUMED_COMPLETION_TOKENS,
     ) -> float:
         return 0.25
 
@@ -149,7 +159,11 @@ async def test_a_failure_before_any_spend_still_reaches_the_caller(tmp_path: Pat
     gateway = FakeGateway()
     draft_id = await _draft(config, gateway, ceiling=0.0001)
 
-    with pytest.raises(CommissionError, match="exceeds ceiling"):
+    # Matches the stable half of the message. The wording around it changed in
+    # #56 ("make the ceiling a bound"), which is what broke the old
+    # "exceeds ceiling" regex — the amounts are interpolated, so anchoring on
+    # them would break again the moment a default moves.
+    with pytest.raises(CommissionError, match="exceeds the .* ceiling"):
         await _start(config, gateway, draft_id)
 
 
