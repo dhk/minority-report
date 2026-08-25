@@ -476,3 +476,13 @@ def test_the_writable_default_is_unchanged(tmp_path: Path) -> None:
     # A POST that reaches the handler and fails validation is a mounted route;
     # 404 would mean it was not mounted at all.
     assert client.post("/review", data={"task": ""}).status_code != 404
+
+
+def test_the_dashboard_tab_renders_and_declares_its_blind_spots(tmp_path: Path) -> None:
+    """#34: composed state, and an explicit account of what it cannot see."""
+    page = _tab_client(tmp_path).get("/dashboard")
+
+    assert page.status_code == 200
+    assert "Dashboard" in page.text
+    assert "What this page cannot see" in page.text
+    assert "nothing here was suggested by a model" in page.text
