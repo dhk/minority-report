@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "minority_report",
+  "project_id": "4f7866e4-2598-451d-82ed-9e574494d9ee"
+}
