@@ -361,7 +361,10 @@ async def test_begin_research_from_paste_requires_separate_confirmation(
     assert state.list_runs() == []
 
     result = await run_research(draft_id.group(1), f"RUN {draft_id.group(1)}")
-    assert "Research run finished" in result
+    assert "Research run started" in result
+    assert "did not wait for it" in result
+    # The run exists the moment the reply lands — that is the point of #33.
+    assert len(state.list_runs()) == 1
     assert len(state.list_runs()) == 1
 
 
@@ -583,12 +586,16 @@ def test_an_unknown_run_id_says_so(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     assert "No commissioned runs" in mcp_server.list_runs()
 
 
-def test_run_research_warns_that_a_timeout_is_not_a_failure() -> None:
-    """The docstring is what the model reads before deciding to retry."""
+def test_run_research_says_it_does_not_wait() -> None:
+    """The docstring is what the model reads before deciding what to do next.
+
+    It used to warn that a timeout was expected. Now the call returns straight
+    away, so the thing to say is that the work continues without it.
+    """
     # Collapse wrapping: the claim is about what the docstring says, not how it
     # is laid out.
     doc = " ".join((mcp_server.run_research.__doc__ or "").split())
 
-    assert "does not mean the run failed" in doc
-    assert "Do not re-dispatch" in doc
-    assert "list_runs" in doc
+    assert "does not wait for the commission to finish" in doc
+    assert "run_status" in doc
+    assert "spends the budget twice" in doc

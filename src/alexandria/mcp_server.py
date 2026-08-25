@@ -18,7 +18,8 @@ import socket
 import subprocess
 import sys
 from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any
 
@@ -28,6 +29,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from alexandria.background import start as start_dispatch
 from alexandria.commission import (
     DEFAULT_GRADING_MODEL,
     DEFAULT_MODELS,
@@ -517,13 +519,12 @@ async def run_research(draft_id: str, confirmation: str = "") -> str:
     supplies the exact confirmation phrase returned with it. A missing or stale
     phrase leaves the draft untouched and dispatches nothing.
 
-    **This blocks until the whole commission finishes** -- every research model,
-    web search if enabled, and grading. That routinely takes several minutes and
-    will exceed a 60-second MCP client timeout (#33). A timeout here does not
-    mean the run failed: dispatch writes its record before calling any model and
-    the server keeps working whether or not anyone is still listening. Use
-    ``list_runs`` to find the run and ``run_status`` to see how it ended. Do not
-    re-dispatch on a timeout -- that spends the budget twice.
+    **This returns as soon as the run has an id — it does not wait for the
+    commission to finish** (#33). The research models, web search and grading
+    continue in the background and write their results to the run store, which
+    takes several minutes. The reply tells you the run id; ``run_status`` tells
+    you how it ended. Do not dispatch the same draft again while one is running
+    -- that spends the budget twice.
     """
     config = _config_or_message()
     if isinstance(config, str):
@@ -542,9 +543,16 @@ async def run_research(draft_id: str, confirmation: str = "") -> str:
                 f'Use the exact confirmation phrase: "{expected}"',
             ]
         )
-    try:
+
+    @asynccontextmanager
+    async def _gateway() -> AsyncIterator[Any]:
+        # Built here, from this module's names, so the gateway stays patchable
+        # where it always was. background.start only runs it.
         async with OpenRouterGateway(openrouter_api_key()) as gateway:
-            run = await CommissionService(config, gateway).dispatch(draft.draft_id)
+            yield gateway
+
+    try:
+        run = await start_dispatch(config, draft.draft_id, gateway_cm=_gateway)
     except (CommissionError, OSError, SecretNotFoundError, ValueError) as exc:
         # The run record is written before any model is called, so a failure
         # here still leaves something findable. Say so rather than implying
@@ -554,14 +562,18 @@ async def run_research(draft_id: str, confirmation: str = "") -> str:
             "If a run id was allocated, `list_runs` will show it and `run_status` "
             "will say how far it got."
         )
-    actual_cost = f"${run.cost_actual:.4f}" if run.cost_actual is not None else "unavailable"
     return "\n".join(
         [
-            "Research run finished.",
+            "Research run started. It is running now; this reply did not wait for it.",
             f"Run: {run.run_id}",
-            f"Status: {run.status}",
-            f"Actual cost: {actual_cost}",
+            f"Models: {', '.join(run.dispatched_models)}",
+            f"Estimate: ${run.cost_estimate:.4f}" if run.cost_estimate else "Estimate: unavailable",
             f"Artifacts: {RunStore(config.data_dir).run_dir(run.run_id)}",
+            "",
+            (
+                f'Check on it with run_status("{run.run_id}"). '
+                "Do not dispatch again — that would spend the budget twice."
+            ),
         ]
     )
 

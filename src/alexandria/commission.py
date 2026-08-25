@@ -11,6 +11,7 @@ import json
 import re
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol, Self, cast
@@ -697,6 +698,16 @@ def _landscape(
     return claim_records, scores
 
 
+@dataclass
+class PreparedRun:
+    """A run that exists on disk and has not been executed yet."""
+
+    run: RunRecord
+    draft: Draft
+    run_dir: Path
+    started: datetime
+
+
 class CommissionService:
     def __init__(self, config: Config, gateway: Gateway) -> None:
         self.config = config
@@ -799,7 +810,14 @@ class CommissionService:
         self.store.save_draft(draft)
         return draft
 
-    async def dispatch(self, draft_id: str) -> RunRecord:
+    def prepare(self, draft_id: str) -> PreparedRun:
+        """Everything that must happen before a run has an id, and no model calls.
+
+        Split out of dispatch for #33: a caller needs the run id in hand before
+        the minutes-long part starts, or a lost reply loses the run. This writes
+        the run record with status "running", so the run is discoverable from
+        the moment it exists.
+        """
         draft = self.store.load_draft(draft_id)
         # The ceiling is checked against the BOUND, not the prediction. A
         # ceiling compared only against an estimate stops nothing: r-2026-0812-03
@@ -859,6 +877,22 @@ class CommissionService:
                     run_dir / "inputs" / "extracted" / f"{item.sha256}.txt",
                     item.text.encode(),
                 )
+
+        return PreparedRun(run=run, draft=draft, run_dir=run_dir, started=started)
+
+    async def execute(self, prepared: PreparedRun) -> RunRecord:
+        """The part that spends money and takes minutes.
+
+        Safe to run detached from whoever asked for it: every result is written
+        to the run store, not returned to a caller who may be gone.
+        """
+        draft, run, run_dir, started = (
+            prepared.draft,
+            prepared.run,
+            prepared.run_dir,
+            prepared.started,
+        )
+        run_id = run.run_id
 
         prompt = _research_prompt(draft.brief, draft.inputs)
         calls = await asyncio.gather(
@@ -1073,3 +1107,11 @@ class CommissionService:
         }
         _write_atomic(run_dir / "manifest.json", _json_bytes(manifest))
         return run
+
+    async def dispatch(self, draft_id: str) -> RunRecord:
+        """Prepare and execute in one call — blocks for the whole commission.
+
+        Kept for callers that genuinely want to wait. Anything user-facing
+        should prepare, hand the id back, and execute in the background (#33).
+        """
+        return await self.execute(self.prepare(draft_id))
