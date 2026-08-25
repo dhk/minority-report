@@ -25,6 +25,7 @@ from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
 from alexandria.background import start as start_dispatch
+from alexandria.brief_in_situ import render as render_brief_in_situ
 from alexandria.commission import (
     DEFAULT_GRADING_MODEL,
     DEFAULT_MODELS,
@@ -570,6 +571,7 @@ view does not pretend to highlight words that cannot be mapped to evidence.</p>
 <section class="claim-document">{_heatmap_claim_blocks(run, claims, scores)}</section>
 <div class="artifact-actions" style="max-width:320px;margin-top:22px">
 <a class="button artifact-action" href="/runs/{_e(run.run_id)}/heatmap.html">Open standalone heatmap</a>
+<a class="button artifact-action" href="/runs/{_e(run.run_id)}/brief.html">Open the brief in situ</a>
 <a class="button artifact-action" href="/runs/{_e(run.run_id)}/bundle.zip">Download bundle</a>
 </div>"""
 
@@ -781,6 +783,32 @@ not imply a word-level mapping.</p></header>
 </main></body></html>"""
 
 
+async def brief_in_situ_html(request: Request) -> Response:
+    """The brief coloured by what it provoked (#37)."""
+    config: Config = request.app.state.config
+    try:
+        store = RunStore(config.data_dir)
+        run = store.load_run(request.path_params["run_id"])
+        claims, _scores = _load_result(config, run)
+        brief_path = store.run_dir(run.run_id) / "brief.md"
+        brief_text = brief_path.read_text(encoding="utf-8") if brief_path.is_file() else ""
+    except (CommissionError, OSError, ValueError) as exc:
+        return Response(f"Brief unavailable: {exc}\n", status_code=404, media_type="text/plain")
+    if not brief_text.strip():
+        return Response(
+            "This run has no brief on disk, so there is nothing to colour.\n",
+            status_code=404,
+            media_type="text/plain",
+        )
+    document = render_brief_in_situ(run, brief_text, claims)
+    banner = (
+        f'<p style="font:13px system-ui;padding:14px 20px;margin:0;'
+        f'border-bottom:1px solid #ccc">'
+        f'<a href="/runs/{_e(run.run_id)}">&larr; Back to run {_e(run.run_id)}</a></p>'
+    )
+    return HTMLResponse(document.replace("<body>", "<body>" + banner, 1))
+
+
 async def heatmap_html(request: Request) -> Response:
     config: Config = request.app.state.config
     try:
@@ -950,6 +978,7 @@ def create_app(config: Config | None = None, *, read_only: bool = False) -> Star
         Route("/runs/{run_id}", result),
         Route("/runs/{run_id}/report.md", report_markdown),
         Route("/runs/{run_id}/heatmap.html", heatmap_html),
+        Route("/runs/{run_id}/brief.html", brief_in_situ_html),
         Route("/runs/{run_id}/bundle.zip", artifact_bundle),
         Route("/flow/{slug}", flow),
     ]
