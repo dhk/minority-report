@@ -64,7 +64,7 @@ from alexandria.publish import PublishError
 from alexandria.publish import publish_run as publish_run_to_corpus
 from alexandria.resolution import RESOLUTION_FILENAME, ResolutionError
 from alexandria.resolution import draft_resolution as draft_resolution_model
-from alexandria.version import service_version
+from alexandria.version import deployed_summary, service_version
 
 server = FastMCP("alexandria")
 
@@ -583,7 +583,16 @@ async def _health(request: Request) -> JSONResponse:
     installations page polls. Never put repository data in this.
     """
     return JSONResponse(
-        {"service": "alexandria", "version": service_version(), "started_at": _STARTED_AT}
+        {
+            "service": "alexandria",
+            "version": service_version(),
+            # The package version never changes between releases, which is how
+            # a host served pre-fix code for a week without anything saying so.
+            # The bundle id does, and this process is the only thing that can
+            # answer it for certain (#61).
+            "build": deployed_summary(),
+            "started_at": _STARTED_AT,
+        }
     )
 
 

@@ -264,6 +264,21 @@ def systemd_unit_installed() -> bool:
     return result.returncode == 0
 
 
+def served_build(host: str, port: int) -> str | None:
+    """What the running server says it is, asked of the server.
+
+    deployed_summary() describes the process that calls it, which is right only
+    when that process is the installed tool. Any other caller — a checkout, a
+    venv, a test — would otherwise report itself and call it the service.
+    """
+    try:
+        with urllib.request.urlopen(f"http://{host}:{port}/health", timeout=2) as response:
+            payload = json.loads(response.read())
+    except (OSError, urllib.error.URLError, ValueError):
+        return None
+    return str(payload.get("build")) if isinstance(payload, dict) else None
+
+
 def _health(host: str, port: int) -> tuple[bool, str]:
     url = f"http://{host}:{port}/health"
     try:
@@ -273,9 +288,10 @@ def _health(host: str, port: int) -> tuple[bool, str]:
         return False, f"unhealthy — {url} did not return Alexandria health"
     if not isinstance(payload, dict) or payload.get("service") != "alexandria":
         return False, f"unhealthy — {url} did not identify itself as Alexandria"
+    build = payload.get("build") or f"v{payload.get('version', '?')}"
     return (
         True,
-        f"healthy — v{payload.get('version', '?')} since {payload.get('started_at', '?')} ({url})",
+        f"healthy — {build} since {payload.get('started_at', '?')} ({url})",
     )
 
 
@@ -474,9 +490,14 @@ def upgrade(
     _git(["fetch", "--quiet", "origin"], source)
     commit = _source_commit(source, ref, force=force)
 
+    served = served_build(host, port)
     manifest = deployed_release() or {}
     running = (manifest.get("source") or {}).get("commit")
-    print(f"  running: {deployed_summary()}", file=stream)
+    if served and served.split(" from ")[-1] != (running or "")[:12]:
+        # The server is the authority. Trust it over this process, which may be
+        # a checkout or a venv rather than the installed tool.
+        running = served.split(" from ")[-1]
+    print(f"  running: {served or deployed_summary() + ' (server not answering)'}", file=stream)
     print(f"  source:  {commit[:12]}", file=stream)
     if running == commit and not force:
         print("Already current; nothing to install.", file=stream)
@@ -522,7 +543,7 @@ def upgrade(
     print("→ restarting services…", file=stream)
     stop_all(use_systemd=systemd_unit_installed(), force=True, stream=stream)
     healthy = start_server(source, host, port, use_systemd=systemd_unit_installed(), stream=stream)
-    print(f"Now serving {deployed_summary()}", file=stream)
+    print(f"Now serving {served_build(host, port) or deployed_summary()}", file=stream)
     if not healthy:
         print(
             "The server did not come back healthy. The previous release is still under "
@@ -625,7 +646,7 @@ def _print_status(
     host_env_file: Path | None = None,
     cwd: Path | None = None,
 ) -> None:
-    print(f"Alexandria {deployed_summary()}", file=stream)
+    print(f"Alexandria {served_build(host, port) or deployed_summary()}", file=stream)
     processes = mcp_processes()
     server = next((item for item in processes if item.is_http), None)
     for line in _corpus_lines(env, host_env_file=host_env_file, cwd=cwd, process=server):
