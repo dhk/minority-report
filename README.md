@@ -5,6 +5,12 @@ Minority Report is the executable orchestration system for the
 adapters, commission dispatch and grading, local run records, MCP and web
 surfaces, packaging, deployment, and host operations.
 
+Research calls can search the live web through OpenRouter's bounded web plugin.
+It is opt-in and requires a stated reason. URL citations returned by the provider
+are deduplicated into the run's `sources.json`, including which research models
+observed each source; grading never searches and therefore cannot introduce
+evidence the research models did not see.
+
 Alexandria separately owns durable evidence, lifecycle, schemas, policy,
 provenance, publication, and research governance. A local run here is not an
 Alexandria corpus artifact until an operator deliberately reviews and promotes

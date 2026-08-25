@@ -102,6 +102,12 @@ class Draft(BaseModel):
     web_search_rationale: str = ""
 
 
+class SourceCitation(BaseModel):
+    url: str
+    title: str | None = None
+    content: str | None = None
+
+
 class CallRecord(BaseModel):
     model_id: str
     resolved_model_id: str | None = None
@@ -120,6 +126,7 @@ class CallRecord(BaseModel):
     #: a partial observation, not an absent one -- but a run must be able to
     #: say which of its answers were cut off.
     truncated: bool = False
+    citations: list[SourceCitation] = Field(default_factory=list)
 
 
 #: docs/confidence-calibration.md §4. The grader emits the pair; the integer is
