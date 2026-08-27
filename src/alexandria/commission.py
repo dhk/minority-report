@@ -14,17 +14,19 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Protocol, Self, cast
+from typing import Any, Literal, Protocol, Self, cast
 
 import httpx
 
 from alexandria.commission_models import (
     Brief,
+    CallCost,
     CallRecord,
     ClaimGroup,
     ClaimRecord,
     CostActual,
     CostEstimate,
+    CostResidual,
     Draft,
     InputArtifact,
     Instrument,
@@ -382,6 +384,18 @@ def _sum_optional(values: list[int | None]) -> int | None:
     return sum(known) if known else None
 
 
+def _call_cost(call: CallRecord, role: Literal["research", "grading"]) -> CallCost:
+    return CallCost(
+        model_id=call.model_id,
+        role=role,
+        prompt_tokens=call.prompt_tokens,
+        completion_tokens=call.completion_tokens,
+        cost=call.cost,
+        status=call.status,
+        truncated=call.truncated,
+    )
+
+
 def _cost_actual(calls: list[CallRecord], grading_calls: list[CallRecord]) -> CostActual:
     """Measure what a run really cost, in the same shape as its estimate.
 
@@ -408,6 +422,57 @@ def _cost_actual(calls: list[CallRecord], grading_calls: list[CallRecord]) -> Co
         billed_call_count=len(totals),
         failed_call_count=sum(1 for call in every_call if call.status == "failed"),
         unpriced_call_count=sum(1 for call in every_call if call.cost is None),
+        per_model=[
+            *(_call_cost(call, "research") for call in calls),
+            *(_call_cost(call, "grading") for call in grading_calls),
+        ],
+    )
+
+
+def _cost_residual(
+    estimate: CostEstimate | None, actual: CostActual, *, web_search: bool
+) -> CostResidual:
+    """Put the estimate's assumptions next to what the run measured.
+
+    Both constants the estimate rests on were set from a single run each. This
+    records the residual per run so they can be fitted from the corpus instead
+    of re-derived by hand (#60).
+
+    The search term is inferred, not observed: the provider bills search results
+    as ordinary prompt tokens, so the only way to size them is measured prompt
+    minus the input we sent. That subtraction is why ``input_tokens`` has to come
+    from the estimate rather than being recomputed here.
+    """
+    model_count = estimate.research_model_count if estimate else 0
+    assumed = estimate.assumed_completion_tokens if estimate else ASSUMED_COMPLETION_TOKENS
+
+    completion_per_model: int | None = None
+    if actual.research_completion_tokens is not None and model_count:
+        completion_per_model = actual.research_completion_tokens // model_count
+
+    search_per_model: int | None = None
+    if web_search and estimate and actual.research_prompt_tokens is not None and model_count:
+        # Never negative: a run whose prompt came in under what we sent means the
+        # subtraction has lost its meaning, not that search returned nothing.
+        measured = actual.research_prompt_tokens // model_count - estimate.input_tokens
+        search_per_model = measured if measured > 0 else None
+
+    def ratio(measured: float | None, assumed_value: float | None) -> float | None:
+        if measured is None or not assumed_value:
+            return None
+        return round(measured / assumed_value, 4)
+
+    return CostResidual(
+        total_ratio=ratio(actual.total_usd, estimate.total_usd if estimate else None),
+        assumed_completion_tokens=assumed,
+        measured_completion_tokens_per_model=completion_per_model,
+        completion_ratio=ratio(completion_per_model, assumed),
+        web_search=web_search,
+        assumed_search_prompt_tokens=WEB_SEARCH_PROMPT_TOKENS if web_search else None,
+        measured_search_prompt_tokens_per_model=search_per_model,
+        search_prompt_ratio=(
+            ratio(search_per_model, WEB_SEARCH_PROMPT_TOKENS) if web_search else None
+        ),
     )
 
 
@@ -1037,6 +1102,7 @@ class CommissionService:
 
         completed = datetime.now(UTC)
         actual = _cost_actual(calls, grading_calls)
+        residual = _cost_residual(draft.estimate_detail, actual, web_search=draft.web_search)
         # Predicted and measured, side by side and per component. One run cannot
         # correct the estimate; a corpus of these can (dhk/alexandria#32).
         _write_atomic(
@@ -1049,6 +1115,7 @@ class CommissionService:
                     else None,
                     "estimate_total_usd": draft.estimate_usd,
                     "actual": actual.model_dump(mode="json"),
+                    "residual": residual.model_dump(mode="json"),
                     "web_search": draft.web_search,
                     "dispatched_models": draft.models,
                     "grading_model": draft.grading_model,
@@ -1076,6 +1143,7 @@ class CommissionService:
                 "completed_at": completed,
                 "elapsed_seconds": round((completed - started).total_seconds(), 3),
                 "cost_actual": round(sum(known_costs), 6) if known_costs else None,
+                "cost_ratio": residual.total_ratio,
                 "limitations": limitations,
             }
         )
