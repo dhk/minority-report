@@ -15,13 +15,14 @@ from alexandria.commission import (
     CommissionError,
     CommissionService,
     OpenRouterGateway,
+    _cost_residual,
     _extracted_claims,
     _landscape,
     _parse_analysis,
     classify_scores,
     score_from_stance,
 )
-from alexandria.commission_models import Brief, CallRecord
+from alexandria.commission_models import Brief, CallRecord, CostActual, CostEstimate
 from alexandria.infrastructure.config import Config
 from alexandria.input_resolution import extract_input
 
@@ -631,6 +632,117 @@ async def test_cost_json_records_prediction_against_measurement(tmp_path: Path) 
     # Both halves must be present, or the pair cannot be fitted later.
     assert cost["estimate"]["assumed_completion_tokens"] == ASSUMED_COMPLETION_TOKENS
     assert cost["dispatched_models"] == ["alpha/model", "beta/model"]
+
+
+@pytest.mark.anyio
+async def test_cost_json_records_a_per_model_breakdown_and_a_ratio(tmp_path: Path) -> None:
+    # The aggregate can say a run cost 5x its estimate; only the per-model rows
+    # can say which model did it, and only the ratio makes that visible without
+    # reading two files and dividing by hand (#60).
+    service = CommissionService(_config(tmp_path), FakeGateway())
+    draft = await service.create_draft(
+        Brief(task="Assess the provider port."),
+        [extract_input("brief.md", b"Keep the port narrow.")],
+        ["alpha/model", "beta/model"],
+        "grader/model",
+        1.0,
+    )
+    run = await service.dispatch(draft.draft_id)
+    cost = json.loads((service.store.run_dir(run.run_id) / "cost.json").read_text(encoding="utf-8"))
+
+    per_model = cost["actual"]["per_model"]
+    assert len(per_model) == cost["actual"]["billed_call_count"]
+    assert [row["role"] for row in per_model].count("research") == 2
+    assert {row["model_id"] for row in per_model} >= {"alpha/model", "beta/model"}
+
+    # The ratio lands on the run record too, not only in cost.json, so a
+    # drifting estimate shows up in the next run rather than six runs later.
+    assert run.cost_ratio == cost["residual"]["total_ratio"]
+    assert draft.estimate_usd is not None
+    assert run.cost_ratio == pytest.approx(0.05 / draft.estimate_usd, rel=1e-3)
+
+
+def test_the_residual_measures_both_constants_against_a_real_run() -> None:
+    """r-2026-0818-01, verbatim from its cost.json.
+
+    Pinned because this run is the evidence that the two constants fail in
+    opposite directions: the assumed completion length is close to right, and
+    the search-prompt assumption -- 80% of a searching run's estimate -- is
+    nearly 4x the measured volume. A change that "fixes the estimate" by moving
+    ASSUMED_COMPLETION_TOKENS should have to break this test first.
+    """
+    estimate = CostEstimate(
+        research_usd=1.829081,
+        grading_usd=0.203394,
+        web_search_usd=0.015,
+        total_usd=2.047475,
+        input_tokens=3798,
+        grading_input_tokens=27798,
+        assumed_completion_tokens=8000,
+        research_model_count=3,
+        worst_case_usd=2.607475,
+    )
+    actual = CostActual(
+        research_usd=0.576406,
+        grading_usd=0.172641,
+        total_usd=0.749047,
+        research_prompt_tokens=128586,
+        research_completion_tokens=21325,
+        grading_prompt_tokens=18337,
+        grading_completion_tokens=7842,
+        billed_call_count=4,
+        failed_call_count=0,
+        unpriced_call_count=0,
+    )
+
+    residual = _cost_residual(estimate, actual, web_search=True)
+
+    # The operator was quoted 2.7x what the run cost.
+    assert residual.total_ratio == pytest.approx(0.3658, abs=1e-4)
+    # Completion length: 7,108 measured against 8,000 assumed. Close.
+    assert residual.measured_completion_tokens_per_model == 7108
+    assert residual.completion_ratio == pytest.approx(0.8885, abs=1e-4)
+    # Search prompt volume: 39,064 measured against 150,000 assumed. Not close,
+    # and it is the term that dominates the estimate.
+    assert residual.measured_search_prompt_tokens_per_model == 39064
+    assert residual.search_prompt_ratio == pytest.approx(0.2604, abs=1e-4)
+
+
+def test_a_run_that_did_not_search_records_no_search_residual() -> None:
+    # Subtracting the input we sent from the prompt we were billed only means
+    # something when search added to it.
+    estimate = CostEstimate(
+        research_usd=0.1,
+        grading_usd=0.05,
+        web_search_usd=0.0,
+        total_usd=0.15,
+        input_tokens=3188,
+        grading_input_tokens=19188,
+        assumed_completion_tokens=8000,
+        research_model_count=2,
+    )
+    actual = CostActual(
+        research_usd=0.2,
+        grading_usd=0.1,
+        total_usd=0.3,
+        research_prompt_tokens=8022,
+        research_completion_tokens=15984,
+        grading_prompt_tokens=9000,
+        grading_completion_tokens=4000,
+        billed_call_count=3,
+        failed_call_count=0,
+        unpriced_call_count=0,
+    )
+
+    residual = _cost_residual(estimate, actual, web_search=False)
+
+    assert residual.web_search is False
+    assert residual.assumed_search_prompt_tokens is None
+    assert residual.measured_search_prompt_tokens_per_model is None
+    assert residual.search_prompt_ratio is None
+    # The completion half is still measured; it does not depend on search.
+    assert residual.measured_completion_tokens_per_model == 7992
+    assert residual.total_ratio == pytest.approx(2.0)
 
 
 @pytest.mark.anyio

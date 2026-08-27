@@ -65,6 +65,49 @@ class CostEstimate(BaseModel):
     worst_case_usd: float | None = None
 
 
+class CallCost(BaseModel):
+    """What one call actually consumed, kept per model rather than summed.
+
+    The aggregate in :class:`CostActual` can say the run cost 5x its estimate;
+    only this can say which model did it. Fitting the assumed completion length
+    needs a per-model residual, because the models do not write to the same
+    length -- measured spread across the corpus is 5,880 to 10,612 tokens.
+    """
+
+    model_id: str
+    role: Literal["research", "grading"]
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    cost: float | None = None
+    status: Literal["success", "failed"]
+    truncated: bool = False
+
+
+class CostResidual(BaseModel):
+    """The estimate's assumptions next to what actually happened.
+
+    Recorded so the two constants the estimate rests on stop being guesses. Both
+    were set from a single observation (see WEB_SEARCH_PROMPT_TOKENS, whose own
+    comment says "One observation, not a fit"); a run that stores its residual
+    contributes a data point instead of needing to be re-derived by hand from
+    cost.json, which is how #60 was written.
+
+    ``total_ratio`` is actual/estimate: below 1.0 the operator was quoted too
+    much, above 1.0 too little.
+    """
+
+    total_ratio: float | None = None
+    assumed_completion_tokens: int
+    measured_completion_tokens_per_model: int | None = None
+    completion_ratio: float | None = None
+    #: Only meaningful when the run searched; search results are billed as
+    #: prompt tokens, and that term is ~80% of a searching run's estimate.
+    web_search: bool = False
+    assumed_search_prompt_tokens: int | None = None
+    measured_search_prompt_tokens_per_model: int | None = None
+    search_prompt_ratio: float | None = None
+
+
 class CostActual(BaseModel):
     """What the run really cost, in the same shape as the estimate."""
 
@@ -78,6 +121,8 @@ class CostActual(BaseModel):
     billed_call_count: int
     failed_call_count: int
     unpriced_call_count: int
+    #: One entry per dispatched call, research and grading alike.
+    per_model: list[CallCost] = Field(default_factory=list)
 
 
 class Draft(BaseModel):
@@ -179,6 +224,9 @@ class RunRecord(BaseModel):
     completed_at: datetime | None = None
     cost_estimate: float | None = None
     cost_actual: float | None = None
+    #: actual/estimate. On the run record, not just cost.json, so a drifting
+    #: estimate is visible in the next run rather than six runs later (#60).
+    cost_ratio: float | None = None
     elapsed_seconds: float | None = None
     inputs: list[InputArtifact]
     dispatched_models: list[str]
