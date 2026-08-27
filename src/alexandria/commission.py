@@ -683,6 +683,48 @@ def _parse_analysis(body: str) -> tuple[dict[str, Any], int]:
         return parsed, repairs
 
 
+#: Characters a model rewrites without changing what was said. Typographic
+#: substitution is the provider's, not the grader's invention, so normalising it
+#: is not the same as tolerating a fabricated span.
+_QUOTE_EQUIVALENTS = str.maketrans(
+    {
+        "\u2018": "'",
+        "\u2019": "'",
+        "\u201c": '"',
+        "\u201d": '"',
+        "\u2013": "-",
+        "\u2014": "-",
+        "\u2026": "...",
+        "\u00a0": " ",
+    }
+)
+
+
+def _normalised_for_quote_check(text: str) -> str:
+    """Collapse the differences a faithful quoter still introduces.
+
+    A grader that rewraps a line is still quoting; one that writes a sentence
+    the source never contained is not. Whitespace is collapsed because the span
+    is copied out of prose that was wrapped, and typographic variants are folded
+    because the provider substitutes them. Nothing here changes a word.
+    """
+    return " ".join(text.translate(_QUOTE_EQUIVALENTS).split())
+
+
+def _quote_is_present(quote: str, body: str | None) -> bool:
+    """Whether the span occurs in the response it claims to come from.
+
+    Substring matching, deliberately: it catches wholesale invention, which is
+    the failure that puts unearned evidence into the public corpus. It does not
+    catch subtle misquotation -- a span assembled from two distant fragments
+    fails, and a very short span can match coincidentally. Recording the verdict
+    is what makes that limit inspectable instead of assumed.
+    """
+    if not body:
+        return False
+    return _normalised_for_quote_check(quote) in _normalised_for_quote_check(body)
+
+
 def _landscape(
     claims: list[dict[str, str]],
     graded: dict[str, tuple[CallRecord, dict[str, Any]]],
@@ -696,6 +738,9 @@ def _landscape(
     """
     responding = [call.model_id for call in calls if call.status == "success"]
     failed = [call.model_id for call in calls if call.status == "failed"]
+    # The quote is a span of the *research* output being scored, not of the
+    # grading call that reported it. graded[model_id] is the latter.
+    bodies = {call.model_id: call.body for call in calls}
     claim_records: list[ClaimRecord] = []
     scores: list[ScoreRecord] = []
 
@@ -739,6 +784,11 @@ def _landscape(
                     strength=strength,
                     score=score,
                     quote=quote,
+                    quote_verified=(
+                        _quote_is_present(quote, bodies.get(model_id))
+                        if quote is not None
+                        else None
+                    ),
                     grading_call_id=call.generation_id,
                 )
             )
@@ -1071,6 +1121,18 @@ class CommissionService:
                         graded[call.model_id] = (graded_call, model_payload)
 
                     claims, scores = _landscape(claim_list, graded, calls)
+                    # Rule 5: a failed observation is an observation. The score
+                    # and its quote are both kept -- what is reported is that
+                    # the evidence did not check out, not that it is absent.
+                    unverified = sum(1 for score in scores if score.quote_verified is False)
+                    if unverified:
+                        checked = sum(1 for score in scores if score.quote_verified is not None)
+                        limitations.append(
+                            f"{unverified} of {checked} quoted span(s) were not found in the "
+                            "response they are attributed to. The scores and quotes are kept, "
+                            "marked quote_verified=false in scores.csv; the evidence under "
+                            "those cells is asserted, not established."
+                        )
                 except (ValueError, TypeError, KeyError, CommissionError) as exc:
                     limitations.append(f"Grading output could not be validated: {exc}")
             else:
@@ -1091,6 +1153,7 @@ class CommissionService:
                 "strength",
                 "score",
                 "quote",
+                "quote_verified",
                 "grading_call_id",
             ],
         )

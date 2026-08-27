@@ -18,7 +18,9 @@ from alexandria.commission import (
     _cost_residual,
     _extracted_claims,
     _landscape,
+    _normalised_for_quote_check,
     _parse_analysis,
+    _quote_is_present,
     classify_scores,
     score_from_stance,
 )
@@ -114,6 +116,45 @@ class PartialGateway(FakeGateway):
                 latency_ms=10,
             )
         return await super().complete(model, prompt, web_search=web_search)
+
+
+class FabricatingGateway(FakeGateway):
+    """A grader that returns a span the research output never contained.
+
+    The failure this exists to catch: the pipeline recorded the quote, the
+    heatmap rendered it as evidence, and publish wrote it into the public
+    corpus, with nothing having compared it to the response (#47).
+    """
+
+    FABRICATION = "the port must be widened immediately"
+
+    async def complete(self, model: str, prompt: str, *, web_search: bool = False) -> CallRecord:
+        call = await super().complete(model, prompt, web_search=web_search)
+        if model == "grader/model" and "CLAIM LIST" in prompt and call.body:
+            payload = json.loads(call.body)
+            for row in payload.get("scores", []):
+                if row.get("quote"):
+                    row["quote"] = self.FABRICATION
+            return call.model_copy(update={"body": json.dumps(payload)})
+        return call
+
+
+class ReflowingGateway(FakeGateway):
+    """A grader quoting faithfully, but rewrapped and with typographic quotes.
+
+    A model that rewraps a line is still quoting. If this does not verify, the
+    check is punishing formatting rather than detecting invention.
+    """
+
+    async def complete(self, model: str, prompt: str, *, web_search: bool = False) -> CallRecord:
+        call = await super().complete(model, prompt, web_search=web_search)
+        if model == "grader/model" and "CLAIM LIST" in prompt and call.body:
+            payload = json.loads(call.body)
+            for row in payload.get("scores", []):
+                if row.get("quote"):
+                    row["quote"] = "provider port\n   should  remain\tnarrow"
+            return call.model_copy(update={"body": json.dumps(payload)})
+        return call
 
 
 class TruncatingGateway(FakeGateway):
@@ -1084,3 +1125,96 @@ async def test_the_run_states_its_own_apparatus(tmp_path: Path) -> None:
     assert stored["instrument"]["grader_topology"] == "per-model-blind"
     # Conformance is derived at read time, never stored (docs/instrument.md §3).
     assert "conforming" not in stored["instrument"]
+
+
+def test_a_reflowed_quote_still_counts_as_quoting() -> None:
+    body = "Evidence from alpha says the provider port\nshould remain narrow."
+    # Rewrapped, and with the typographic variants a provider substitutes.
+    assert _quote_is_present("provider port   should remain narrow", body)
+    assert _quote_is_present("provider\tport should\nremain narrow", body)
+
+
+def test_an_invented_span_is_not_quoting() -> None:
+    body = "Evidence from alpha says the provider port should remain narrow."
+    assert not _quote_is_present("the port must be widened immediately", body)
+    # A failed research call has no body to have quoted.
+    assert not _quote_is_present("anything at all", None)
+
+
+def test_normalisation_folds_typography_without_changing_words() -> None:
+    folded = _normalised_for_quote_check("“it depends” — the honest answer…")
+    assert folded == '"it depends" - the honest answer...'
+
+
+@pytest.mark.anyio
+async def test_a_fabricated_quote_is_recorded_not_dropped(tmp_path: Path) -> None:
+    # Rule 5: a failed observation is an observation. Dropping the quote would
+    # leave a score that looks unevidenced, when what actually happened is that
+    # its evidence did not check out.
+    service = CommissionService(_config(tmp_path), FabricatingGateway())
+    draft = await service.create_draft(
+        Brief(task="Assess the provider port."),
+        [extract_input("brief.md", b"Keep the port narrow.")],
+        ["alpha/model", "beta/model"],
+        "grader/model",
+        1.0,
+    )
+    run = await service.dispatch(draft.draft_id)
+
+    rows = list(
+        csv.DictReader((service.store.run_dir(run.run_id) / "scores.csv").read_text().splitlines())
+    )
+    quoted = [row for row in rows if row["quote"]]
+    assert quoted, "the fixture must produce at least one quoted score"
+    for row in quoted:
+        assert row["quote"] == FabricatingGateway.FABRICATION
+        assert row["quote_verified"] == "False"
+        # The score itself survives; only its evidence is impeached.
+        assert row["score"]
+
+    assert any("not found in the response" in line for line in run.limitations)
+
+
+@pytest.mark.anyio
+async def test_a_faithful_quote_verifies_through_reflow(tmp_path: Path) -> None:
+    service = CommissionService(_config(tmp_path), ReflowingGateway())
+    draft = await service.create_draft(
+        Brief(task="Assess the provider port."),
+        [extract_input("brief.md", b"Keep the port narrow.")],
+        ["alpha/model", "beta/model"],
+        "grader/model",
+        1.0,
+    )
+    run = await service.dispatch(draft.draft_id)
+
+    rows = list(
+        csv.DictReader((service.store.run_dir(run.run_id) / "scores.csv").read_text().splitlines())
+    )
+    quoted = [row for row in rows if row["quote"]]
+    assert quoted
+    assert all(row["quote_verified"] == "True" for row in quoted)
+    assert not any("not found in the response" in line for line in run.limitations)
+
+
+@pytest.mark.anyio
+async def test_a_score_with_no_quote_is_unchecked_rather_than_failed(tmp_path: Path) -> None:
+    # A silent stance carries no quote, and a failed research call has no score
+    # at all. Neither is a verification failure, and marking them False would
+    # put a fabrication count on runs that fabricated nothing.
+    service = CommissionService(_config(tmp_path), PartialGateway())
+    draft = await service.create_draft(
+        Brief(task="Assess the provider port."),
+        [extract_input("brief.md", b"Keep the port narrow.")],
+        ["alpha/model", "beta/model"],
+        "grader/model",
+        1.0,
+    )
+    run = await service.dispatch(draft.draft_id)
+
+    rows = list(
+        csv.DictReader((service.store.run_dir(run.run_id) / "scores.csv").read_text().splitlines())
+    )
+    unquoted = [row for row in rows if not row["quote"]]
+    assert unquoted, "the fixture must produce a silent or failed row"
+    assert all(row["quote_verified"] == "" for row in unquoted)
+    assert not any("not found in the response" in line for line in run.limitations)
