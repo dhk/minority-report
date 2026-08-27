@@ -185,6 +185,12 @@ class ScoreRecord(BaseModel):
     strength: Strength | None = None
     score: int | None
     quote: str | None
+    #: Whether the quote was found in the response it is attributed to.
+    #: True checked and present, False checked and absent, None never checked --
+    #: which is every run banked before the check existed. A mismatch is
+    #: recorded rather than dropped: a removed quote leaves a score that looks
+    #: unevidenced, when what happened is that its evidence did not check out.
+    quote_verified: bool | None = None
     grading_call_id: str | None
 
 

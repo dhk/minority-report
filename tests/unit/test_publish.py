@@ -11,7 +11,7 @@ import pytest
 from alexandria.commission import RunStore
 from alexandria.commission_models import RunRecord
 from alexandria.infrastructure.config import Config
-from alexandria.publish import PublishError, publish_run
+from alexandria.publish import PublishError, _quotes_kept, publish_run
 
 
 def _config(tmp_path: Path) -> Config:
@@ -185,3 +185,21 @@ def test_a_partial_run_publishes_but_says_so(tmp_path: Path) -> None:
     result = publish_run(config, "r-2026-0810-01", "2026-08-10-a-question")
 
     assert any("partial" in item for item in result.needs_operator)
+
+
+def test_the_public_corpus_carries_whether_a_quote_checked_out() -> None:
+    """A published quote must travel with its verdict.
+
+    Publishing evidence that was never checked, or that failed its check, with
+    no way to tell either from evidence that held up, is the failure #47 named:
+    the surface still looks like provenance, only the check is missing.
+    """
+    published = _quotes_kept(
+        "claim_id,model_id,stance,strength,score,quote,quote_verified,grading_call_id\r\n"
+        "c1,alpha/model,supports,strong,3,remain narrow,True,gen-1\r\n"
+        "c1,beta/model,supports,weak,1,invented span,False,gen-2\r\n"
+    )
+
+    assert "quote_verified" in published.splitlines()[0]
+    assert "invented span,False" in published
+    assert "remain narrow,True" in published
