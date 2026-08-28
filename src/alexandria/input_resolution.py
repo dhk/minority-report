@@ -15,6 +15,7 @@ import httpx
 from pypdf import PdfReader
 
 from alexandria.commission_models import InputArtifact, InputState
+from alexandria.infrastructure.secrets import ENV_GITHUB_TOKEN, github_token
 
 MAX_FILES = 8
 MAX_BYTES = 20 * 1024 * 1024
@@ -157,12 +158,18 @@ class GitHubResolver:
     """Resolve repository, issue, PR, and blob URLs through GitHub's public API."""
 
     def __init__(self, client: httpx.AsyncClient | None = None) -> None:
+        token = github_token()
+        headers = {"Accept": "application/vnd.github+json", "User-Agent": "alexandria/0.1"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
         self.client = client or httpx.AsyncClient(
             base_url="https://api.github.com",
-            headers={"Accept": "application/vnd.github+json", "User-Agent": "alexandria/0.1"},
+            headers=headers,
             timeout=30,
         )
         self._owns_client = client is None
+        # Read back from the client so an injected one reports its own auth state.
+        self._authenticated = "Authorization" in self.client.headers
 
     async def __aenter__(self) -> Self:
         return self
@@ -174,8 +181,13 @@ class GitHubResolver:
     async def _json(self, path: str) -> object:
         response = await self.client.get(path)
         if response.status_code >= 400:
+            # GitHub answers 404 rather than 403 for private resources the caller
+            # cannot see, so an unauthenticated 404 is ambiguous. Say so.
+            hint = ""
+            if response.status_code == 404 and not self._authenticated:
+                hint = f" It may not exist, or it may be private and no {ENV_GITHUB_TOKEN} is set."
             raise InputResolutionError(
-                f"GitHub resolution failed ({response.status_code}) for {path}."
+                f"GitHub resolution failed ({response.status_code}) for {path}.{hint}"
             )
         return response.json()
 
