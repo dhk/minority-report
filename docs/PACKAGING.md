@@ -36,6 +36,39 @@ loopback. Use an SSH port forward rather than a public bind on a headless host.
 The component front panel and `--check` are no-spend installation checks; they do
 not call providers or prove an end-to-end research run.
 
+## Pack manager
+
+The first pack installed from this release bootstraps a root-owned generic
+manager at `/usr/local/bin/tool-pack-manager`. It is a Lobster-side inbox for
+deployment packs: copy an archive and its `.sha256` into one directory and run
+it there.
+
+```bash
+tool-pack-manager              # numbered inventory of the current directory
+tool-pack-manager -C ~/incoming
+tool-pack-manager list
+tool-pack-manager --json list
+tool-pack-manager run 1
+tool-pack-manager delete 1
+```
+
+`run` reads the manifest without extracting, verifies the sidecar, rejects
+absolute paths, traversal, links, devices, and archives over the unpacked
+safety limit, then extracts atomically and invokes that pack's installer from
+the transfer directory. A missing checksum requires the explicit
+`run --allow-unverified <selector>` form; a malformed or mismatched checksum is
+always refused.
+
+`delete` is recoverable quarantine, not removal. It moves only the selected
+archive, checksum, and matching unpacked transfer directory under
+`~/.local/share/tool-pack-manager/trash/`, alongside a `restore.json` recording
+their original paths. Installed releases, rollback copies, application data,
+secrets, service units, and registry entries are never deletion targets. There
+is no permanent purge; that stays a separate, explicit operator decision.
+
+An earlier managed manager is backed up before replacement; an unknown
+executable at that path is refused non-interactively.
+
 ## Sensitive state
 
 Archives exclude Git data, virtual environments, build output, application data,

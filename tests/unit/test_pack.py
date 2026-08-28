@@ -38,6 +38,7 @@ from deploy.install import (
     environment_preview,
     existing_environment_value,
     export_constraints,
+    install_pack_manager,
     install_root_needs_adoption,
     install_support,
     mark_install_root,
@@ -90,6 +91,10 @@ def _repo(tmp_path: Path) -> Path:
     (repo / ".gitignore").write_text("ignored.txt\ndist/\n", encoding="utf-8")
     (repo / "deploy/install.py").write_text("#!/usr/bin/env python3\n", encoding="utf-8")
     (repo / "deploy/docs.py").write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+    (repo / "deploy/pack_manager.py").write_text(
+        "#!/usr/bin/env python3\n# tool-pack-manager-format: 1\n",
+        encoding="utf-8",
+    )
     (repo / "deploy/checks.py").write_text(
         (ROOT / "deploy/checks.py").read_text(encoding="utf-8"), encoding="utf-8"
     )
@@ -811,6 +816,7 @@ def test_build_bundle_contains_manifest_installer_and_current_worktree(tmp_path:
         readme_name = f"{result.bundle_root}/source/README.md"
         assert f"{result.bundle_root}/install.py" in names
         assert f"{result.bundle_root}/launch-docs.py" in names
+        assert f"{result.bundle_root}/manage-packs.py" in names
         assert f"{result.bundle_root}/deploy/__init__.py" in names
         assert f"{result.bundle_root}/deploy/checks.py" in names
         assert f"{result.bundle_root}/docs-index.html" in names
@@ -819,6 +825,11 @@ def test_build_bundle_contains_manifest_installer_and_current_worktree(tmp_path:
         extracted = bundle.extractfile(readme_name)
         assert extracted is not None
         assert extracted.read() == b"working tree\n"
+        manifest_stream = bundle.extractfile(f"{result.bundle_root}/pack-manifest.json")
+        assert manifest_stream is not None
+        manifest = json.load(manifest_stream)
+        assert manifest["pack_manager"]["install_path"] == "/usr/local/bin/tool-pack-manager"
+        assert manifest["pack_manager"]["privileged"] is True
 
 
 def test_build_bundle_requires_opt_in_for_large_files(tmp_path: Path) -> None:
@@ -1002,6 +1013,7 @@ def test_installed_support_preserves_docs_without_a_second_source_copy(tmp_path:
     bundle = tmp_path / "sample-tool-release-1"
     bundle.mkdir()
     (bundle / "launch-docs.py").write_text("# launcher\n", encoding="utf-8")
+    (bundle / "manage-packs.py").write_text("# manager\n", encoding="utf-8")
     (bundle / "docs-index.html").write_text("docs\n", encoding="utf-8")
     (bundle / "pack-manifest.json").write_text("{}\n", encoding="utf-8")
     (bundle / "deploy").mkdir()
@@ -1014,6 +1026,7 @@ def test_installed_support_preserves_docs_without_a_second_source_copy(tmp_path:
     support = install_support(bundle, install_root, release, "release-1")
 
     assert (support / "launch-docs.py").read_text(encoding="utf-8") == "# launcher\n"
+    assert (support / "manage-packs.py").read_text(encoding="utf-8") == "# manager\n"
     assert (support / "docs-index.html").is_file()
     assert (support / "deploy" / "checks.py").is_file()
     assert (support / "source").is_symlink()
@@ -1046,6 +1059,109 @@ def test_cleanup_removes_only_exact_transfer_artifacts(tmp_path: Path) -> None:
     assert not bundle.exists()
     assert unrelated.read_text(encoding="utf-8") == "keep\n"
     assert installed_release.is_dir()
+
+
+def test_pack_manager_install_is_atomic_and_backs_up_managed_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "manage-packs.py").write_text(
+        "#!/usr/bin/env python3\n# tool-pack-manager-format: 1\nnew\n",
+        encoding="utf-8",
+    )
+    target = home / ".local/bin/tool-pack-manager"
+    target.parent.mkdir(parents=True)
+    target.write_text(
+        "#!/usr/bin/env python3\n# tool-pack-manager-format: 1\nold\n",
+        encoding="utf-8",
+    )
+    manifest = {
+        "pack_manager": {
+            "format_version": 1,
+            "install_path": "~/.local/bin/tool-pack-manager",
+        }
+    }
+
+    installed = install_pack_manager(
+        bundle,
+        manifest,
+        interactive=False,
+        input_fn=lambda _prompt: "",
+    )
+
+    assert installed == target
+    assert target.read_text(encoding="utf-8").endswith("new\n")
+    backups = list(target.parent.glob("tool-pack-manager.bak-*"))
+    assert len(backups) == 1
+    assert backups[0].read_text(encoding="utf-8").endswith("old\n")
+    assert target.stat().st_mode & 0o777 == 0o755
+
+
+def test_pack_manager_install_refuses_unknown_noninteractive_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "manage-packs.py").write_text(
+        "#!/usr/bin/env python3\n# tool-pack-manager-format: 1\n",
+        encoding="utf-8",
+    )
+    target = home / ".local/bin/tool-pack-manager"
+    target.parent.mkdir(parents=True)
+    target.write_text("unknown\n", encoding="utf-8")
+
+    with pytest.raises(InstallError, match="unknown pack manager"):
+        install_pack_manager(
+            bundle,
+            {"pack_manager": {"install_path": str(target)}},
+            interactive=False,
+            input_fn=lambda _prompt: "",
+        )
+
+
+def test_privileged_pack_manager_install_uses_root_owned_atomic_copy(tmp_path: Path) -> None:
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    source = bundle / "manage-packs.py"
+    source.write_text(
+        "#!/usr/bin/env python3\n# tool-pack-manager-format: 1\n",
+        encoding="utf-8",
+    )
+    target = tmp_path / "usr/local/bin/tool-pack-manager"
+    commands: list[list[str]] = []
+
+    installed = install_pack_manager(
+        bundle,
+        {
+            "pack_manager": {
+                "install_path": str(target),
+                "privileged": True,
+            }
+        },
+        interactive=False,
+        input_fn=lambda _prompt: "",
+        runner=lambda command: commands.append(list(command)),
+    )
+
+    assert installed == target
+    assert commands[0] == ["sudo", "install", "-d", "-m", "0755", str(target.parent)]
+    assert commands[1] == [
+        "sudo",
+        "install",
+        "-o",
+        "root",
+        "-g",
+        "root",
+        "-m",
+        "0755",
+        str(source),
+        str(target),
+    ]
 
 
 def test_cleanup_refuses_a_renamed_bundle_directory(tmp_path: Path) -> None:
@@ -1453,6 +1569,11 @@ def test_component_panel_proves_release_command_config_and_docs(
     executable.parent.mkdir(parents=True)
     executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     executable.chmod(0o755)
+    manager = home / ".local" / "bin" / "tool-pack-manager"
+    manager.write_text(
+        "#!/usr/bin/env python3\n# tool-pack-manager-format: 1\n",
+        encoding="utf-8",
+    )
     secrets = home / ".config" / "sample-tool" / "secrets.env"
     secrets.parent.mkdir(parents=True)
     secrets.write_text("SAMPLE_API_KEY=configured\n", encoding="utf-8")
@@ -1484,6 +1605,7 @@ def test_component_panel_proves_release_command_config_and_docs(
                 "health_service": "sample-tool",
             }
         ],
+        "pack_manager": {"install_path": "~/.local/bin/tool-pack-manager"},
         "capability": {"token_file": "~/.local/share/sample-tool/token"},
     }
 
@@ -1493,6 +1615,7 @@ def test_component_panel_proves_release_command_config_and_docs(
     assert by_key["release"].state == "pass"
     assert by_key["command"].state == "pass"
     assert by_key["host_configuration"].state == "pass"
+    assert by_key["pack_manager"].state == "pass"
     assert by_key["configuration"].state == "pass"
     assert by_key["service"].state == "skip"
     assert by_key["health"].state == "skip"
